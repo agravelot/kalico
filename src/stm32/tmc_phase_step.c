@@ -24,45 +24,26 @@ DECL_CONSTANT("PHASE_STEPPING", 1);
 
 // Electrical period of Trinamic drivers (MSCNT range)
 #define MOTOR_PERIOD 1024
-// Number of electrical periods per full mechanical revolution
-// (50 pole pairs = 50 electrical periods per rev for a standard 200-step motor)
-// This is configurable per-stepper via steps_per_period
-#define SIN_FRACTION 4
-#define SIN_PERIOD (SIN_FRACTION * MOTOR_PERIOD)  // 4096
-
 // Refresh rate: 10 kHz = 100 µs period
 #define REFRESH_FREQ 10000
-// Maximum burst events per refresh cycle
-#define GPIO_BUFFER_SIZE 200
 
 struct phase_stepper {
-    struct timer timer;
     uint8_t oid;
     uint8_t stepper_oid;
-    // GPIO pins (same as the associated stepper)
     struct gpio_out step_pin;
     struct gpio_out dir_pin;
-    uint32_t step_mask;       // BSRR bit for step SET
-    uint32_t step_reset_mask; // BSRR bit for step RESET
-    uint32_t dir_set_mask;    // BSRR bit for dir SET
-    uint32_t dir_reset_mask;  // BSRR bit for dir RESET
-    // Correction LUT: one int8_t per electrical microstep
+    uint32_t step_mask;
+    uint32_t step_reset_mask;
+    uint32_t dir_set_mask;
+    uint32_t dir_reset_mask;
     int8_t phase_shift_lut[MOTOR_PERIOD];
     int8_t phase_shift_lut_bwd[MOTOR_PERIOD];
     int8_t *current_lut;
-    // Phase tracking
-    uint32_t last_position;
-    uint16_t motor_phase;     // Current electrical phase (0..1023)
-    uint16_t driver_phase;    // TMC driver phase estimate (0..1023)
-    int32_t zero_rotor_phase; // Phase offset at logical position 0
-    uint32_t steps_per_period;// Motor steps per electrical period
-    uint32_t scale_factor;    // Precomputed: POSITION_BIAS * MOTOR_PERIOD / steps_per_period
-    // Burst state
-    uint32_t event_buffer[GPIO_BUFFER_SIZE];
-    uint8_t max_event;
-    bool axis_forward;        // Current step direction
+    uint16_t motor_phase;
+    uint16_t driver_phase;
+    int32_t zero_rotor_phase;
+    uint32_t steps_per_period;
     bool enabled;
-    bool pending_lut;
 };
 
 static struct phase_stepper *phase_steppers[8];
@@ -77,14 +58,16 @@ static uint_fast8_t phase_stepping_refresh(struct timer *t);
 
 // ---- Helpers ----
 
-// Compute motor electrical phase from stepper position
+// Compute motor electrical phase from stepper position.
+// Position from stepper_get_position() has a POSITION_BIAS offset (0x40000000)
+// representing zero physical steps.
 static inline uint16_t
 pos_to_phase(struct phase_stepper *ps, uint32_t position)
 {
-    // phase = ((position + POSITION_BIAS) * MOTOR_PERIOD / steps_per_period
+    // phase = ((position - POSITION_BIAS) * MOTOR_PERIOD / steps_per_period
     //          + zero_rotor_phase) % MOTOR_PERIOD
-    uint32_t adjusted = position + 0x40000000; // POSITION_BIAS
-    uint32_t phase = ((uint64_t)adjusted * MOTOR_PERIOD) / ps->steps_per_period;
+    uint32_t step_count = position - 0x40000000;
+    uint32_t phase = ((uint64_t)step_count * MOTOR_PERIOD) / ps->steps_per_period;
     phase = (phase + ps->zero_rotor_phase) % MOTOR_PERIOD;
     return (uint16_t)phase;
 }
@@ -120,38 +103,15 @@ burst_steps(struct phase_stepper *ps, int32_t diff)
     if (diff == 0)
         return;
 
-    bool forward;
-    if (diff > 0) {
-        forward = true;
-    } else {
-        forward = false;
-        diff = -diff;
-    }
+    bool forward = diff > 0;
+    uint32_t count = forward ? (uint32_t)diff : (uint32_t)(-diff);
 
+    GPIO_TypeDef *regs = (GPIO_TypeDef *)ps->step_pin.regs;
     set_direction(ps, forward);
 
-    // Evenly space step toggles in the GPIO buffer
-    // Each toggle = step_pin HIGH then LOW = 2 events per microstep
-    uint32_t toggles = (uint32_t)diff * 2;
-    if (toggles > GPIO_BUFFER_SIZE)
-        toggles = GPIO_BUFFER_SIZE;
-
-    // Fixed-point spacing: (GPIO_BUFFER_SIZE << 16) / toggles
-    uint32_t spacing = ((uint32_t)GPIO_BUFFER_SIZE << 16) / toggles;
-    uint32_t frac = 0;
-    uint8_t idx = 0;
-    bool high = true;
-    GPIO_TypeDef *regs = (GPIO_TypeDef *)ps->step_pin.regs;
-
-    for (uint32_t i = 0; i < toggles && idx < GPIO_BUFFER_SIZE; i++) {
-        if (high)
-            regs->BSRR = ps->step_mask;
-        else
-            regs->BSRR = ps->step_reset_mask;
-        high = !high;
-
-        frac += spacing;
-        idx = (uint8_t)(frac >> 16);
+    for (uint32_t i = 0; i < count; i++) {
+        regs->BSRR = ps->step_mask;
+        regs->BSRR = ps->step_reset_mask;
     }
 }
 
@@ -165,37 +125,20 @@ phase_stepping_refresh(struct timer *t)
         if (!ps->enabled)
             continue;
 
-        // Apply pending LUT swap
-        if (ps->pending_lut) {
-            ps->current_lut = (ps->current_lut == ps->phase_shift_lut)
-                ? ps->phase_shift_lut_bwd : ps->phase_shift_lut;
-            ps->pending_lut = false;
-        }
-
-        // Read current stepper position
         uint32_t position = stepper_get_position_by_oid(ps->stepper_oid);
-
-        // Compute motor electrical phase
         uint16_t motor_phase = pos_to_phase(ps, position);
         ps->motor_phase = motor_phase;
 
-        // Lookup correction from LUT
         int8_t correction = ps->current_lut[motor_phase];
-
-        // Compute target (corrected) phase
         uint16_t target_phase = (motor_phase + correction + MOTOR_PERIOD) % MOTOR_PERIOD;
-
-        // Compute phase difference from driver estimate
         int32_t diff = phase_diff(target_phase, ps->driver_phase);
 
-        // Burst steps to correct
         if (diff != 0) {
             burst_steps(ps, diff);
             ps->driver_phase = target_phase;
         }
     }
 
-    // Reschedule for next refresh
     t->waketime += refresh_period_ticks;
     return SF_RESCHEDULE;
 }
@@ -210,35 +153,22 @@ command_configure_phase_stepping(uint32_t *args)
                                           sizeof(*ps));
     ps->oid = oid;
     ps->stepper_oid = args[1];
-
-    // Set up GPIO pins (same pins as the stepper)
     ps->step_pin = gpio_out_setup(args[2], 0);
     ps->dir_pin = gpio_out_setup(args[3], 0);
-
-    // BSRR masks for atomic GPIO writes
     ps->step_mask = ps->step_pin.bit;
     ps->step_reset_mask = ps->step_pin.bit << 16;
     ps->dir_set_mask = ps->dir_pin.bit;
     ps->dir_reset_mask = ps->dir_pin.bit << 16;
-
-    // Params
     ps->zero_rotor_phase = args[4];
     ps->steps_per_period = args[5];
-
-    // Default to empty LUT (no correction)
     for (int i = 0; i < MOTOR_PERIOD; i++) {
         ps->phase_shift_lut[i] = 0;
         ps->phase_shift_lut_bwd[i] = 0;
     }
     ps->current_lut = ps->phase_shift_lut;
-    ps->pending_lut = false;
-
     ps->motor_phase = 0;
     ps->driver_phase = 0;
-    ps->last_position = 0;
     ps->enabled = false;
-
-    // Register in global list
     if (num_phase_steppers < MAX_PHASE_STEPPERS)
         phase_steppers[num_phase_steppers++] = ps;
 }
