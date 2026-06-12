@@ -114,6 +114,10 @@ class PhaseStepping:
             "PHASE_STEPPING_STATUS", "STEPPER", self.name,
             self.cmd_PHASE_STEPPING_STATUS,
             desc=self.cmd_PHASE_STEPPING_STATUS_help)
+        gcode.register_mux_command(
+            "PHASE_STEPPING_CALIBRATE", "STEPPER", self.name,
+            self.cmd_PHASE_STEPPING_CALIBRATE,
+            desc=self.cmd_PHASE_STEPPING_CALIBRATE_help)
 
     def _load_correction(self, corr, data):
         try:
@@ -311,6 +315,13 @@ class PhaseStepping:
         for k, (mag, pha) in status["correction_items"].items():
             lines.append("  %s: mag=%.4f pha=%.4f" % (k, mag, pha))
         gcmd.respond_info("\n".join(lines))
+
+    cmd_PHASE_STEPPING_CALIBRATE_help = "Run phase stepping calibration"
+
+    def cmd_PHASE_STEPPING_CALIBRATE(self, gcmd):
+        from . import phase_stepping_calibration
+        cal = phase_stepping_calibration.CalibrateAxis(self)
+        cal.calibrate(gcmd)
 
 
 def load_config_prefix(config):
