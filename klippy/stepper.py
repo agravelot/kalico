@@ -98,6 +98,12 @@ class MCU_stepper:
     def get_pulse_duration(self):
         return self._step_pulse_duration, self._step_both_edge
 
+    def get_step_pin(self):
+        return self._step_pin
+
+    def get_dir_pin(self):
+        return self._dir_pin
+
     def setup_default_pulse_duration(self, pulse_duration, step_both_edge):
         if self._step_pulse_duration is None:
             self._step_pulse_duration = pulse_duration
