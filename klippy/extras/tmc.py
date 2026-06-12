@@ -423,10 +423,34 @@ class TMCCommandHelper:
     def _query_phase(self):
         field_name = "mscnt"
         if self.fields.lookup_register(field_name, None) is None:
-            # TMC2660 uses MSTEP
             field_name = "mstep"
         reg = self.mcu_tmc.get_register(self.fields.lookup_register(field_name))
         return self.fields.get_field(field_name, reg)
+
+    def query_phase(self):
+        return self._query_phase()
+
+    def set_phase_stepping_mode(self, print_time):
+        self._saved_mres = self.fields.get_field("mres")
+        self._saved_intpol = self.fields.get_field("intpol")
+        self._saved_ihold = self.fields.get_field("ihold")
+        self._saved_irun = self.fields.get_field("irun")
+        self.fields.set_field("mres", 0)
+        self.fields.set_field("intpol", 0)
+        self.fields.set_field("ihold", self._saved_irun)
+        reg = self.fields.registers["CHOPCONF"]
+        self.mcu_tmc.set_register("CHOPCONF", reg, print_time)
+        reg = self.fields.registers["IHOLD_IRUN"]
+        self.mcu_tmc.set_register("IHOLD_IRUN", reg, print_time)
+
+    def restore_phase_stepping_mode(self, print_time):
+        self.fields.set_field("mres", self._saved_mres)
+        self.fields.set_field("intpol", self._saved_intpol)
+        self.fields.set_field("ihold", self._saved_ihold)
+        reg = self.fields.registers["CHOPCONF"]
+        self.mcu_tmc.set_register("CHOPCONF", reg, print_time)
+        reg = self.fields.registers["IHOLD_IRUN"]
+        self.mcu_tmc.set_register("IHOLD_IRUN", reg, print_time)
 
     def _handle_sync_mcu_pos(self, stepper):
         if stepper.get_name() != self.stepper_name:

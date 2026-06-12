@@ -87,6 +87,7 @@ ReadRegisters = [
     "PWM_SCALE",
     "PWM_AUTO",
     "TSTEP",
+    "XACTUAL",
 ]
 
 Fields = {}
