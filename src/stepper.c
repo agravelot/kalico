@@ -472,6 +472,16 @@ stepper_get_position(struct stepper *s)
     return position;
 }
 
+uint32_t
+stepper_get_position_by_oid(uint8_t oid)
+{
+    struct stepper *s = stepper_oid_lookup(oid);
+    irq_disable();
+    uint32_t pos = stepper_get_position(s);
+    irq_enable();
+    return pos;
+}
+
 // Report the current position of the stepper
 void
 command_stepper_get_position(uint32_t *args)

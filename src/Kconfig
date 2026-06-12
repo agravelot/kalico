@@ -331,6 +331,16 @@ config WANT_STEPPER_OPTIMIZED_BOTH_EDGE
         take a step only on the "rising" or "falling" level of the
         step pin).
 
+config WANT_TMC_PHASE_STEP
+    bool "Support TMC Phase Stepping burst engine"
+    depends on HAVE_GPIO && MACH_STM32
+    default n
+    help
+        Enables phase stepping burst engine support on the MCU.
+        This injects microstep correction pulses via GPIO BSRR
+        writes to compensate for stepper motor imperfections.
+        Only supported on STM32 architectures.
+
 # Support setting gpio state at startup
 config INITIAL_PINS
     string "GPIO pins to set at micro-controller startup"

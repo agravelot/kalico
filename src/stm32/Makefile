@@ -99,6 +99,8 @@ src-$(CONFIG_WANT_HARD_PWM) += stm32/hard_pwm.c
 sdio-src-y := stm32/sdio.c
 src-$(CONFIG_HAVE_GPIO_SDIO) += $(sdio-src-y)
 
+src-$(CONFIG_WANT_TMC_PHASE_STEP) += stm32/tmc_phase_step.c
+
 # Binary output file rules
 target-y += $(OUT)klipper.bin
 
