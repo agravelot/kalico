@@ -481,6 +481,7 @@ stepper_get_position_by_oid(uint8_t oid)
     irq_enable();
     return pos;
 }
+// PHASE_STEPPING: exposed for tmc_phase_step.c
 
 // Report the current position of the stepper
 void

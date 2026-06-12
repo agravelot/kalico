@@ -43,7 +43,7 @@ struct phase_stepper {
     uint16_t driver_phase;
     int32_t zero_rotor_phase;
     uint32_t steps_per_period;
-    bool enabled;
+    uint8_t enabled;
 };
 
 static struct phase_stepper *phase_steppers[8];
@@ -86,7 +86,7 @@ phase_diff(uint16_t target, uint16_t current)
 
 // Write direction pin for an axis
 static inline void
-set_direction(struct phase_stepper *ps, bool forward)
+set_direction(struct phase_stepper *ps, uint8_t forward)
 {
     GPIO_TypeDef *regs = (GPIO_TypeDef *)ps->dir_pin.regs;
     if (forward)
@@ -103,7 +103,7 @@ burst_steps(struct phase_stepper *ps, int32_t diff)
     if (diff == 0)
         return;
 
-    bool forward = diff > 0;
+    uint8_t forward = diff > 0;
     uint32_t count = forward ? (uint32_t)diff : (uint32_t)(-diff);
 
     GPIO_TypeDef *regs = (GPIO_TypeDef *)ps->step_pin.regs;
@@ -168,7 +168,7 @@ command_configure_phase_stepping(uint32_t *args)
     ps->current_lut = ps->phase_shift_lut;
     ps->motor_phase = 0;
     ps->driver_phase = 0;
-    ps->enabled = false;
+    ps->enabled = 0;
     if (num_phase_steppers < MAX_PHASE_STEPPERS)
         phase_steppers[num_phase_steppers++] = ps;
 }
@@ -203,7 +203,7 @@ command_enable_phase_stepping(uint32_t *args)
 {
     uint8_t oid = args[0];
     struct phase_stepper *ps = oid_lookup(oid, command_configure_phase_stepping);
-    ps->enabled = args[1] ? true : false;
+    ps->enabled = args[1] ? 1 : 0;
 
     if (ps->enabled) {
         // Reset phase tracking on enable
