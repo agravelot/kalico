@@ -24,16 +24,20 @@ DECL_CONSTANT("PHASE_STEPPING", 1);
 
 // Electrical period of Trinamic drivers (MSCNT range)
 #define MOTOR_PERIOD 1024
-// LUT granularity: 1024 entries — one per electrical microstep
-#define LUT_SIZE 1024
+// LUT granularity: 256 entries (4 microsteps per LUT cell).
+// 1024 entries is the per-microstep ideal but triggers a multi-chunk
+// upload regression (Klippy disconnect) that we have not yet diagnosed;
+// once the chunking path is fixed, bump this back to 1024.
+#define LUT_SIZE 256
 #define LUT_SCALE (MOTOR_PERIOD / LUT_SIZE)
 // Refresh rate: 10 kHz = 100 µs period
 #define REFRESH_FREQ 10000
 
 // Maximum number of phase-stepping instances. Two LUTs of LUT_SIZE
 // bytes per instance, allocated statically so the heap stays free
-// for move queue / OID pool. At 8 instances × 2 × 1024 = 16 KB,
-// well within the STM32F446's 128 KB RAM.
+// for move queue / OID pool. At 8 instances × 2 × 256 = 4 KB,
+// well within the STM32F446's 128 KB RAM. (1024-entry LUT would be
+// 16 KB and is the upper bound for this RAM budget.)
 #define MAX_PHASE_STEPPERS 8
 static int8_t phase_shift_luts[MAX_PHASE_STEPPERS][2][LUT_SIZE];
 

@@ -9,7 +9,7 @@
 import logging, math, base64, struct
 
 MOTOR_PERIOD = 1024
-LUT_SIZE = 1024
+LUT_SIZE = 256
 SIN_FRACTION = 4
 SIN_PERIOD = SIN_FRACTION * MOTOR_PERIOD
 MAG_FRACTIONAL = 8
@@ -203,8 +203,13 @@ class PhaseStepping:
         for i in range(LUT_SIZE):
             data[i] = int(fwd[i]) & 0xFF
             data[i + LUT_SIZE] = int(bwd[i]) & 0xFF
-        # PT_buffer max length is 255 bytes, so chunk the upload.
-        chunk = 200
+        # PT_buffer max length is 59 bytes (MESSAGE_PAYLOAD_MAX in
+        # klippy/chelper/msgblock.h). Larger chunks overflow the
+        # queue_message.msg[64] buffer in serialqueue_send and corrupt
+        # the heap, disconnecting the MCU. 50 bytes leaves headroom
+        # for msgid(1) + oid(1) + offset(2) + len(1) = 5 byte header
+        # before the 64-byte total cap.
+        chunk = 50
         for off in range(0, len(data), chunk):
             self.load_lut_cmd.send(
                 [self.phase_oid, off, list(data[off:off + chunk])])
@@ -238,15 +243,50 @@ class PhaseStepping:
         print_time = toolhead.get_last_move_time()
 
         if enable:
-            self._enable_stripped(print_time)
+            self._enable(print_time)
         else:
             self._disable(print_time)
 
-    def _enable_stripped(self, print_time):
+    def _enable(self, print_time):
         if not self.enable_cmd:
             return
-        # Push current stepper dir inversion to the MCU so the right
-        # LUT (forward vs backward) is selected from the first tick.
+        # 1. Set TMC into phase-stepping mode (saves _saved_mres, etc.
+        #    in tmc.py so disable can restore).
+        if self.tmc_module is not None:
+            self.tmc_module.set_phase_stepping_mode(print_time)
+        # 2. Sync MCU's zero_phase with the live TMC MSCNT so the first
+        #    ISR tick computes correction from the right baseline.
+        self._sync_phase_offset()
+        # 3. Push the current correction LUT to the MCU.
+        self._send_lut()
+        # 4. Push current stepper dir inversion to the MCU so the right
+        #    LUT (forward vs backward) is selected from the first tick.
+        if self.direction_cmd is not None:
+            invert, _ = self.stepper.get_dir_inverted()
+            self.direction_cmd.send([self.phase_oid, 0 if invert else 1])
+        # 5. Arm the ISR.
+        self.enable_cmd.send([self.phase_oid, 1])
+
+        # 6. Adjust the kinematic rotation distance so the existing
+        # full-step move count maps to 256 microsteps (or whatever
+        # the TMC was configured for).
+        rot_dist, steps_per_rot = self.stepper.get_rotation_distance()
+        new_steps = self.full_steps * 256
+        self._saved_steps_per_rot = steps_per_rot
+        self.stepper.set_rotation_distance(
+            rot_dist * new_steps / steps_per_rot)
+        self.enabled = True
+        logging.info("phase_stepping: enabled for %s", self.stepper_name)
+
+    def _enable_stripped(self, print_time):
+        # Stripped-down enable used while debugging the multi-chunk
+        # LUT load regression. Skips TMC mode set, MSCNT sync, LUT
+        # upload, and dwell — only the direction + enable commands
+        # are sent. Not for production use; see
+        # docs/phase_stepping_plan.md "Multi-chunk LUT load: open
+        # issue" for the test matrix.
+        if not self.enable_cmd:
+            return
         if self.direction_cmd is not None:
             invert, _ = self.stepper.get_dir_inverted()
             self.direction_cmd.send([self.phase_oid, 0 if invert else 1])
@@ -258,7 +298,8 @@ class PhaseStepping:
         self.stepper.set_rotation_distance(
             rot_dist * new_steps / steps_per_rot)
         self.enabled = True
-        logging.info("phase_stepping: enabled for %s", self.stepper_name)
+        logging.info("phase_stepping: stripped enable for %s",
+                     self.stepper_name)
 
     def _disable(self, print_time):
         if self.phase_oid is None:
