@@ -98,6 +98,22 @@ set_direction(struct phase_stepper *ps, uint8_t forward)
 
 // Burst step pulses for a phase correction difference
 // 'diff' is in microsteps (signed). Positive = forward, negative = backward.
+//
+// TMC5160 STEP input requires a minimum pulse width of 100 ns for both
+// high and low phases (~f_STP max 1 MHz with that constraint, though
+// newer revisions accept higher rates). The BSRR set/reset pair is only
+// a few cycles (~10 ns at 180 MHz) so we insert 20 NOPs (~110 ns with
+// margin) between them. The delay is only paid when the ISR is actually
+// bursting pulses (zero-correction case is free).
+static inline void
+step_pulse_delay(void)
+{
+    __NOP(); __NOP(); __NOP(); __NOP(); __NOP();
+    __NOP(); __NOP(); __NOP(); __NOP(); __NOP();
+    __NOP(); __NOP(); __NOP(); __NOP(); __NOP();
+    __NOP(); __NOP(); __NOP(); __NOP(); __NOP();
+}
+
 static void
 burst_steps(struct phase_stepper *ps, int32_t diff)
 {
@@ -112,7 +128,9 @@ burst_steps(struct phase_stepper *ps, int32_t diff)
 
     for (uint32_t i = 0; i < count; i++) {
         regs->BSRR = ps->step_mask;
+        step_pulse_delay();
         regs->BSRR = ps->step_reset_mask;
+        step_pulse_delay();
     }
 }
 
@@ -271,6 +289,20 @@ command_set_phase_stepping_direction(uint32_t *args)
 }
 DECL_COMMAND(command_set_phase_stepping_direction,
              "set_phase_stepping_direction oid=%c forward=%c");
+
+void
+command_set_phase_stepping_zero_phase(uint32_t *args)
+{
+    uint8_t oid = args[0];
+    struct phase_stepper *ps = oid_lookup(oid, command_configure_phase_stepping);
+    if (!ps)
+        return;
+    // zero_phase wraps modulo MOTOR_PERIOD in pos_to_phase but the
+    // modulo is on a uint64_t so any uint32_t value is safe.
+    ps->zero_rotor_phase = args[1];
+}
+DECL_COMMAND(command_set_phase_stepping_zero_phase,
+             "set_phase_stepping_zero_phase oid=%c zero_phase=%i");
 
 // ---- Init ----
 

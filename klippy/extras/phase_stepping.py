@@ -191,7 +191,11 @@ class PhaseStepping:
         self.enable_cmd = mcu.lookup_command(
             "enable_phase_stepping oid=%c enable=%c", cq=self._enable_cq)
         self.direction_cmd = mcu.lookup_command(
-            "set_phase_stepping_direction oid=%c forward=%c", cq=self._enable_cq)
+            "set_phase_stepping_direction oid=%c forward=%c",
+            cq=self._enable_cq)
+        self.zero_phase_cmd = mcu.lookup_command(
+            "set_phase_stepping_zero_phase oid=%c zero_phase=%i",
+            cq=self._enable_cq)
 
     def _send_lut_init(self):
         pass
@@ -270,6 +274,10 @@ class PhaseStepping:
         if self.direction_cmd is not None:
             invert, _ = self.stepper.get_dir_inverted()
             self.direction_cmd.send([self.phase_oid, 0 if invert else 1])
+        # 4b. Push the synced zero_phase to the MCU so the first ISR
+        #     tick computes correction from the right rotor offset.
+        if self.zero_phase_cmd is not None:
+            self.zero_phase_cmd.send([self.phase_oid, self.zero_phase])
         # 5. Arm the ISR.
         self.enable_cmd.send([self.phase_oid, 1])
 
