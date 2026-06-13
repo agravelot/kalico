@@ -9,7 +9,7 @@
 import logging, math, base64, struct
 
 MOTOR_PERIOD = 1024
-LUT_SIZE = 256
+LUT_SIZE = 1024
 SIN_FRACTION = 4
 SIN_PERIOD = SIN_FRACTION * MOTOR_PERIOD
 MAG_FRACTIONAL = 8
@@ -195,10 +195,15 @@ class PhaseStepping:
             return
         fwd = self.correction_fwd.build_phase_shift()
         bwd = self.correction_bwd.build_phase_shift()
+        # Concatenate forward + backward LUTs into a single buffer.
+        # MCU splits at offset=LUT_SIZE (command_load_phase_lut
+        # treats the first LUT_SIZE bytes as forward, the rest as
+        # backward).
         data = bytearray(LUT_SIZE * 2)
         for i in range(LUT_SIZE):
             data[i] = int(fwd[i]) & 0xFF
             data[i + LUT_SIZE] = int(bwd[i]) & 0xFF
+        # PT_buffer max length is 255 bytes, so chunk the upload.
         chunk = 200
         for off in range(0, len(data), chunk):
             self.load_lut_cmd.send(

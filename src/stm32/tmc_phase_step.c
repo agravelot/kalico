@@ -24,25 +24,31 @@ DECL_CONSTANT("PHASE_STEPPING", 1);
 
 // Electrical period of Trinamic drivers (MSCNT range)
 #define MOTOR_PERIOD 1024
-// LUT granularity: 256 entries covering 1024 electrical phases
-#define LUT_SIZE 256
+// LUT granularity: 1024 entries — one per electrical microstep
+#define LUT_SIZE 1024
 #define LUT_SCALE (MOTOR_PERIOD / LUT_SIZE)
-// Refresh rate: 1 kHz = 1000 µs period
-#define REFRESH_FREQ 1000
+// Refresh rate: 10 kHz = 100 µs period
+#define REFRESH_FREQ 10000
+
+// Maximum number of phase-stepping instances. Two LUTs of LUT_SIZE
+// bytes per instance, allocated statically so the heap stays free
+// for move queue / OID pool. At 8 instances × 2 × 1024 = 16 KB,
+// well within the STM32F446's 128 KB RAM.
+#define MAX_PHASE_STEPPERS 8
+static int8_t phase_shift_luts[MAX_PHASE_STEPPERS][2][LUT_SIZE];
 
 struct phase_stepper {
     uint8_t oid;
     uint8_t stepper_oid;
+    uint8_t lut_index;           // index into phase_shift_luts
     struct gpio_out step_pin;
     struct gpio_out dir_pin;
     uint32_t step_mask;
     uint32_t step_reset_mask;
     uint32_t dir_set_mask;
     uint32_t dir_reset_mask;
-    int8_t phase_shift_lut[LUT_SIZE];
-    int8_t phase_shift_lut_bwd[LUT_SIZE];
     int8_t *current_lut;
-    uint8_t forward;            // 1 = use phase_shift_lut, 0 = use _bwd
+    uint8_t forward;            // 1 = forward LUT, 0 = backward LUT
     uint16_t motor_phase;
     uint16_t driver_phase;
     int32_t zero_rotor_phase;
@@ -50,12 +56,10 @@ struct phase_stepper {
     uint8_t enabled;
 };
 
-static struct phase_stepper *phase_steppers[8];
+static struct phase_stepper *phase_steppers[MAX_PHASE_STEPPERS];
 static uint8_t num_phase_steppers;
 static struct timer refresh_timer;
 static uint32_t refresh_period_ticks;
-
-#define MAX_PHASE_STEPPERS 8
 
 // Forward declaration
 static uint_fast8_t phase_stepping_refresh(struct timer *t);
@@ -151,17 +155,19 @@ command_configure_phase_stepping(uint32_t *args)
     ps->dir_reset_mask = ps->dir_pin.bit << 16;
     ps->zero_rotor_phase = args[4];
     ps->steps_per_period = args[5];
+    if (num_phase_steppers >= MAX_PHASE_STEPPERS)
+        shutdown("phase_step: too many instances");
+    ps->lut_index = num_phase_steppers;
     for (int i = 0; i < LUT_SIZE; i++) {
-        ps->phase_shift_lut[i] = 0;
-        ps->phase_shift_lut_bwd[i] = 0;
+        phase_shift_luts[ps->lut_index][0][i] = 0;
+        phase_shift_luts[ps->lut_index][1][i] = 0;
     }
-    ps->current_lut = ps->phase_shift_lut;
+    ps->current_lut = phase_shift_luts[ps->lut_index][0];
     ps->forward = 1;
     ps->motor_phase = 0;
     ps->driver_phase = 0;
     ps->enabled = 0;
-    if (num_phase_steppers < MAX_PHASE_STEPPERS)
-        phase_steppers[num_phase_steppers++] = ps;
+    phase_steppers[num_phase_steppers++] = ps;
 }
 DECL_COMMAND(command_configure_phase_stepping,
              "configure_phase_stepping oid=%c stepper_oid=%c"
@@ -185,9 +191,10 @@ command_load_phase_lut(uint32_t *args)
 
     for (uint16_t i = 0; i < data_len; i++) {
         if (offset + i < LUT_SIZE)
-            ps->phase_shift_lut[offset + i] = (int8_t)data[i];
+            phase_shift_luts[ps->lut_index][0][offset + i] = (int8_t)data[i];
         else
-            ps->phase_shift_lut_bwd[offset + i - LUT_SIZE] = (int8_t)data[i];
+            phase_shift_luts[ps->lut_index][1][offset + i - LUT_SIZE]
+                = (int8_t)data[i];
     }
 }
 DECL_COMMAND(command_load_phase_lut,
@@ -205,8 +212,7 @@ command_enable_phase_stepping(uint32_t *args)
     if (ps->enabled) {
         ps->motor_phase = 0;
         ps->driver_phase = 0;
-        ps->current_lut = ps->forward ? ps->phase_shift_lut
-                                       : ps->phase_shift_lut_bwd;
+        ps->current_lut = phase_shift_luts[ps->lut_index][ps->forward ? 0 : 1];
     }
 }
 DECL_COMMAND(command_enable_phase_stepping,
@@ -223,8 +229,7 @@ command_set_phase_stepping_direction(uint32_t *args)
     if (ps->forward == forward)
         return;
     ps->forward = forward;
-    ps->current_lut = forward ? ps->phase_shift_lut
-                              : ps->phase_shift_lut_bwd;
+    ps->current_lut = phase_shift_luts[ps->lut_index][forward ? 0 : 1];
 }
 DECL_COMMAND(command_set_phase_stepping_direction,
              "set_phase_stepping_direction oid=%c forward=%c");

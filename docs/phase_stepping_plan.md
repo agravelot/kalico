@@ -537,7 +537,7 @@ so `mcu.create_oid()` and `mcu.add_config_cmd()` execute inside
 - `_handle_dir_inverted` — listens on the correct event
   `stepper:set_dir_inverted` (the prior registration was for
   `stepper:set_sdir_inverted`, a typo that meant the handler never
-  fired). On dir inversion change, sends
+  fired). On dir inversion, sends
   `set_phase_stepping_direction oid=%c forward=%c` to swap
   `current_lut` between forward and backward LUTs.
 - `set_phase_stepping_direction` MCU command — added in
@@ -548,6 +548,17 @@ so `mcu.create_oid()` and `mcu.add_config_cmd()` execute inside
   `command_enable_phase_stepping` and
   `command_set_phase_stepping_direction` both consult it when
   re-arming `current_lut`.
+- ISR rate restored to 10 kHz (`REFRESH_FREQ 10000` in
+  `src/stm32/tmc_phase_step.c`).
+- LUT restored to 1024 entries by moving
+  `phase_shift_luts[MAX_PHASE_STEPPERS][2][LUT_SIZE]` into static
+  BSS (16 KB at MAX_PHASE_STEPPERS=8) instead of embedding
+  `int8_t phase_shift_lut[LUT_SIZE]` per heap-allocated
+  `phase_stepper`. Each `phase_stepper` now holds a
+  `uint8_t lut_index` instead of the two inline arrays; the
+  configure / load / enable / direction commands index through it.
+  Phase correction granularity is now 1 electrical microstep
+  (MOTOR_PERIOD / LUT_SIZE = 1024 / 1024 = 1) instead of 4.
 
 ### Changes from Original Plan
 
