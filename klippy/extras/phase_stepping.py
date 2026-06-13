@@ -35,10 +35,12 @@ def _sin_lut(x):
     if quo == 0:
         return _SIN_LUT[rem]
     if quo == 1:
-        return _SIN_LUT[1024 - rem]
+        # rem=0 -> 1024-0=1024, but _SIN_LUT is [0..1023]; wrap to 0
+        return -_SIN_LUT[rem] if rem == 0 else _SIN_LUT[1024 - rem]
     if quo == 2:
         return -_SIN_LUT[rem]
-    return -_SIN_LUT[1024 - rem]
+    # quo == 3
+    return _SIN_LUT[rem] if rem == 0 else -_SIN_LUT[1024 - rem]
 
 
 class MotorPhaseCorrection:
@@ -118,6 +120,10 @@ class PhaseStepping:
             "PHASE_STEPPING_CALIBRATE", "STEPPER", self.name,
             self.cmd_PHASE_STEPPING_CALIBRATE,
             desc=self.cmd_PHASE_STEPPING_CALIBRATE_help)
+        gcode.register_mux_command(
+            "PHASE_STEPPING_SET_HARMONIC", "STEPPER", self.name,
+            self.cmd_PHASE_STEPPING_SET_HARMONIC,
+            desc=self.cmd_PHASE_STEPPING_SET_HARMONIC_help)
 
     def _load_correction(self, corr, data):
         try:
@@ -365,6 +371,22 @@ class PhaseStepping:
         from . import phase_stepping_calibration
         cal = phase_stepping_calibration.CalibrateAxis(self)
         cal.calibrate(gcmd)
+
+    cmd_PHASE_STEPPING_SET_HARMONIC_help = (
+        "Set a single correction harmonic. Usage: SET_HARMONIC H=<n>"
+        " MAG=<float> PHA=<float> DIR=<forward|backward>")
+
+    def cmd_PHASE_STEPPING_SET_HARMONIC(self, gcmd):
+        h = gcmd.get_int("H", minval=1, maxval=16)
+        mag = gcmd.get_float("MAG", 0.0)
+        pha = gcmd.get_float("PHA", 0.0)
+        direction = gcmd.get("DIR", "forward")
+        corr = (self.correction_fwd if direction == "forward"
+                else self.correction_bwd)
+        corr.set_harmonic(h, mag, pha)
+        self._send_lut()
+        gcmd.respond_info("Set harmonic %d: mag=%.4f pha=%.4f (%s) for %s"
+                          % (h, mag, pha, direction, self.stepper_name))
 
 
 def load_config_prefix(config):
