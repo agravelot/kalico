@@ -282,53 +282,75 @@ class CalibrateAxis:
         toolhead = self.printer.lookup_object("toolhead")
         force_move = self.printer.lookup_object("force_move")
         stepper = force_move.lookup_stepper(self.ps.stepper_name)
-        # Move distance: 1 full revolution (1.0 rev). Convert rev/s
-        # to mm/s using the stepper's rotation_distance.
-        revs_per_move = 1.0
         rot_dist = self._get_rotation_distance(stepper)
         if rot_dist is None or rot_dist <= 0:
             raise gcmd.error(
                 "Cannot determine rotation_distance for %s"
                 % self.ps.stepper_name)
+        # Move distance: 0.1 rev per trial. At 1 rev/s that's 100ms,
+        # enough for several 100ms DFT windows. The fine search does
+        # another n_phases moves at half this distance. Total
+        # displacement is bounded by alternating direction.
+        revs_per_move = 0.1
         dist_mm = revs_per_move * rot_dist
         speed_mm_s = speed * rot_dist
+        # Track total displacement; abort if we exceed 80mm in either
+        # direction from the start position.
+        start_pos = self._current_rail_pos(toolhead, stepper)
+        if start_pos is None:
+            start_pos = toolhead.get_position()[0]
+        max_total_disp = 80.0
+        total_disp = 0.0
         best_pha = 0.0
         best_resp = float("inf")
-        results = []
+        # Coarse sweep
         for i in range(n_phases):
             pha = 2.0 * math.pi * i / n_phases
+            # Alternate direction to oscillate around start
+            direction = 1 if i % 2 == 0 else -1
+            trial_dist = direction * dist_mm
+            self._check_displacement(start_pos, start_pos + total_disp + trial_dist,
+                                     max_total_disp, gcmd)
             corr = self.ps.get_correction("forward")
             corr.set_harmonic(harmonic, mag, pha)
             self.ps.update_correction()
             aclient = accelerometer.start_internal_client()
-            # accel=0.0: pure constant-velocity, no trapezoidal profile.
-            # This guarantees the harmonic analysis is valid.
-            force_move.manual_move(stepper, dist_mm, speed_mm_s, accel=0.0)
+            force_move.manual_move(stepper, trial_dist, speed_mm_s, accel=0.0)
             toolhead.wait_moves()
             aclient.finish_measurements()
             samples = aclient.get_samples()
+            total_disp += trial_dist
             if not samples:
-                results.append((pha, float("inf")))
                 continue
             resp = self._dft_at_harmonic(
                 samples, speed, motor_steps, harmonic)
-            results.append((pha, resp))
+            gcmd.respond_info("      pha=%.3f dir=%+d resp=%.4f"
+                              % (pha, direction, resp))
             if resp < best_resp:
                 best_resp = resp
                 best_pha = pha
-        # Fine search: ±π/n_phases around the coarse best, with the
-        # same number of points. Interpolate to sub-bin resolution.
+        # Fine search: ±π/n_phases around the coarse best. Half distance
+        # to stay within bounds even if we're near the limit.
+        fine_dist = dist_mm * 0.5
         fine_lo = best_pha - math.pi / n_phases
         fine_hi = best_pha + math.pi / n_phases
         for i in range(n_phases):
-            pha = fine_lo + (fine_hi - fine_lo) * i / (n_phases - 1)
+            pha = fine_lo + (fine_hi - fine_lo) * i / max(1, n_phases - 1)
+            direction = 1 if i % 2 == 0 else -1
+            trial_dist = direction * fine_dist
+            try:
+                self._check_displacement(start_pos, start_pos + total_disp + trial_dist,
+                                         max_total_disp, gcmd)
+            except gcmd.error:
+                break
             corr.set_harmonic(harmonic, mag, pha)
             self.ps.update_correction()
             aclient = accelerometer.start_internal_client()
-            force_move.manual_move(stepper, dist_mm, speed_mm_s, accel=0.0)
+            force_move.manual_move(stepper, trial_dist, speed_mm_s, accel=0.0)
             toolhead.wait_moves()
             aclient.finish_measurements()
             samples = aclient.get_samples()
+            total_disp += trial_dist
             if not samples:
                 continue
             resp = self._dft_at_harmonic(
@@ -337,6 +359,33 @@ class CalibrateAxis:
                 best_resp = resp
                 best_pha = pha
         return best_pha, best_resp
+
+    def _current_rail_pos(self, toolhead, stepper):
+        """Get the toolhead position projected onto this stepper's rail."""
+        try:
+            kin = toolhead.get_kinematics()
+            for rail in kin.rails:
+                for s in rail.get_steppers():
+                    if s.get_name() == stepper.get_name():
+                        name = rail.get_name()
+                        pos = toolhead.get_position()
+                        if name == 'stepper_x':
+                            return pos[0]
+                        elif name == 'stepper_y':
+                            return pos[1]
+            return None
+        except Exception:
+            return None
+
+    def _check_displacement(self, start_pos, current_pos, max_disp, gcmd):
+        """Raise gcmd.error if the current position would exceed the
+        displacement limit from the start position."""
+        if abs(current_pos - start_pos) > max_disp:
+            raise gcmd.error(
+                "Calibration aborted: toolhead would move %.1fmm from"
+                " start (limit %.1fmm). Move closer to center and"
+                " retry."
+                % (current_pos - start_pos, max_disp))
 
     def _get_rotation_distance(self, stepper):
         try:
@@ -416,13 +465,46 @@ class CalibrateAxis:
         except Exception:
             pass
 
+        # SAFETY: Center the toolhead before any motion. The phase
+        # sweep does ~30 small moves; if they all go in the same
+        # direction, accumulated displacement can exceed the rail
+        # length and crash into an endstop. Centering first gives us
+        # ±175mm of headroom on a 350mm X axis.
+        cur_pos = toolhead.get_position()
+        kin = toolhead.get_kinematics()
+        rails = kin.rails
+        # Find the rail that owns this stepper so we know which axis
+        # to center on.
+        stepper_rail = None
+        for rail in rails:
+            for s in rail.get_steppers():
+                if s.get_name() == self.ps.stepper_name:
+                    stepper_rail = rail
+                    break
+            if stepper_rail is not None:
+                break
+        if stepper_rail is not None:
+            rail_name = stepper_rail.get_name()
+            r_min, r_max = stepper_rail.get_range()
+            center = 0.5 * (r_min + r_max)
+            if rail_name == 'stepper_x':
+                center_pos = [center, cur_pos[1], cur_pos[2], cur_pos[3]]
+            elif rail_name == 'stepper_y':
+                center_pos = [cur_pos[0], center, cur_pos[2], cur_pos[3]]
+            else:
+                center_pos = None
+            if center_pos is not None:
+                gcmd.respond_info(
+                    "  Centering toolhead: moving to %s for %s"
+                    % (center_pos, rail_name))
+                toolhead.manual_move(center_pos, 6000.0)
+                toolhead.wait_moves()
+
         # Phase 1: Speed sweep. Drive the stepper (not the toolhead)
         # via force_move to avoid crashing into endstops. We do a
-        # constant-velocity move (accel=0.0) of N revolutions at the
-        # configured speed range. The beacon accelerometer is on the
-        # toolhead, so we need real toolhead motion for vibration
-        # measurement — but the *kinematics* of the move are still
-        # single-stepper so we can use force_move safely.
+        # short constant-velocity move of N revolutions at the
+        # configured speed range. Distance is bounded to 100mm
+        # (so we don't hit an endstop even from center).
         gcmd.respond_info("Phase 1: Speed sweep...")
         aclient = accel_chip.start_internal_client()
 
@@ -438,14 +520,14 @@ class CalibrateAxis:
         dist_mm = revs * rot_dist
         speed_mm_s = avg_speed * rot_dist
 
-        # Make sure we have headroom on the toolhead's X/Y range. The
-        # beacon's toolhead can be at any position; if the move would
-        # exceed the rail, we cancel. Voron2 350 has ~350mm X travel.
-        if dist_mm > 200:
+        # Hard bound: 100mm per single move. Centered toolhead has
+        # at least 150mm headroom on a 350mm axis.
+        MAX_MOVE_MM = 100.0
+        if dist_mm > MAX_MOVE_MM:
             gcmd.respond_info(
-                "  WARNING: requested move %.1fmm > safe 200mm,"
-                " reducing revs" % dist_mm)
-            revs = 200.0 / rot_dist
+                "  WARNING: requested move %.1fmm > safe %dmm,"
+                " reducing revs" % (dist_mm, MAX_MOVE_MM))
+            revs = MAX_MOVE_MM / rot_dist
             dist_mm = revs * rot_dist
 
         gcmd.respond_info(
