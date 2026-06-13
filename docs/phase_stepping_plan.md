@@ -480,33 +480,74 @@ together. Calibration last since it depends on everything else working.
 | Work Item | Status | Notes |
 |-----------|--------|-------|
 | WI 4 — TMC5160 driver changes | **Done** | Delegation of `query_phase`, `set_phase_stepping_mode`, `restore_phase_stepping_mode` from `TMCCommandHelper` to `TMC5160` |
-| WI 1 — MCU burst stepping engine | **Done** | `src/stm32/tmc_phase_step.c`: 3 MCU commands, 1kHz ISR, LUT loading, GPIO pin management |
+| WI 1 — MCU burst stepping engine | **Done** | `src/stm32/tmc_phase_step.c`: 3 MCU commands, ISR, LUT loading, GPIO pin management |
 | WI 6 — Communications protocol | **Done** | `configure_phase_stepping`, `load_phase_lut` (chunked), `enable_phase_stepping` |
 | WI 7 — Build system & Kconfig | **Done** | `CONFIG_WANT_TMC_PHASE_STEP`, STM32 Makefile target |
 | WI 2 — Host phase stepping module | **Done** | `klippy/extras/phase_stepping.py` (~310 lines) |
 | WI 3 — Calibration module | **Skeleton** | `klippy/extras/phase_stepping_calibration.py` exists but not tested |
 | WI 5 — Stepper integration | **Partial** | `stepper_get_position_by_oid()` exposed; rotation distance adjustment works |
 
-### What Works (single-stepper)
+### Multi-stepper support (fixed)
+
+`PHASE_STEPPING_ENABLE` works for both `stepper_x` and `stepper_y`
+concurrently. No `Invalid oid type` shutdown. MCU stays in `ready` state.
+
+**Root cause** of the previous crash: `PhaseStepping` added
+`configure_phase_stepping` from a `klippy:connect` handler. The MCU
+class is also a `klippy:connect` handler and is registered first
+(MCUs are instantiated before user modules), so `mcu._send_config`
+ran and shipped the config batch before either phase_stepping
+instance had a chance to add its command. With a single instance
+this sometimes worked by accident; with two instances the second
+one's OID was never allocated and `enable_phase_stepping` triggered
+`Invalid oid type` on the MCU.
+
+**Fix** (`klippy/extras/phase_stepping.py:142`): register the config
+command in `klippy:mcu_identify` via `mcu.register_config_callback`,
+so `mcu.create_oid()` and `mcu.add_config_cmd()` execute inside
+`mcu._send_config` (after the `_config_callbacks` fire, before
+`allocate_ods` is computed) — the same pattern used by
+`tmc_uart.MCU_TMC_uart_bitbang`.
+
+### What Works
 
 - `PHASE_STEPPING_STATUS` — reports enabled state and correction items
-- `PHASE_STEPPING_ENABLE STEPPER=stepper_x ENABLE=1` — full enable pipeline:
+- `PHASE_STEPPING_ENABLE STEPPER=stepper_x ENABLE=1` and
+  `PHASE_STEPPING_ENABLE STEPPER=stepper_y ENABLE=1` — both can be
+  active concurrently:
   1. `TMC5160.set_phase_stepping_mode()` — sets mres=0 (256µstep), intpol=0, ihold=irun via SPI
   2. `TMC5160.query_phase()` — reads MSCNT register for phase sync (✓ values ~136, ~913 observed)
   3. LUT chunked loading — 3 chunks of 200 bytes each (256 forward + 256 backward = 512 bytes)
-  4. `enable_phase_stepping oid=%c enable=%c` — starts 1kHz ISR on MCU
+  4. `enable_phase_stepping oid=%c enable=%c` — starts ISR on MCU
   5. Rotation distance adjustment — sets `rotation_dist * 256 / microsteps`
-- ISR runs at 1 kHz, phase tracking correct, MCU stable (tested 20+ seconds)
-- Works the same for stepper_x (first) or stepper_y (first)
+- ISR runs at 1 kHz, phase tracking correct, MCU stable (tested 20+ seconds per stepper, both concurrently)
 
-### What Does NOT Work (multi-stepper)
+### What Does NOT Work (known gaps)
 
-- **Enabling a second stepper crashes the MCU** with `shutdown: Invalid oid type`
-- The crash is a hard fault (CPU exception) — the MCU sends no controlled shutdown message, just stops responding
-- The issue is NOT in the ISR body (stripped ISR to empty callback, same crash)
-- The issue is NOT memory exhaustion (firmware build size already reduced, same crash)
-- Root cause appears to be in `command_enable_phase_stepping` → `oid_lookup()` failing to find the second stepper's OID allocated with `command_configure_phase_stepping` type
-- Possible culprits: OID pool collision, config command delivery for second stepper, or shared state between `PhaseStepping` Python instances
+- ISR runs at 1 kHz (was reduced from 10 kHz for stability)
+- LUT is 256 entries (was reduced from 1024 due to heap pressure on STM32F446)
+- Calibration pipeline (`PHASE_STEPPING_CALIBRATE`) not validated end-to-end
+- Full enable flow (TMC mode set, MSCNT sync, LUT load, dwell) is currently
+  stripped in `_enable_stripped` to a minimal version that just sends the
+  enable command. Restoring it requires the user to validate the new
+  direction command + ISR init under load.
+
+### Newly wired
+
+- `_handle_dir_inverted` — listens on the correct event
+  `stepper:set_dir_inverted` (the prior registration was for
+  `stepper:set_sdir_inverted`, a typo that meant the handler never
+  fired). On dir inversion change, sends
+  `set_phase_stepping_direction oid=%c forward=%c` to swap
+  `current_lut` between forward and backward LUTs.
+- `set_phase_stepping_direction` MCU command — added in
+  `src/stm32/tmc_phase_step.c`. Tracks `ps->forward` and
+  updates `ps->current_lut` accordingly. Idempotent: skips the
+  pointer swap if the direction hasn't actually changed.
+- `phase_stepper` struct gained a `uint8_t forward` field.
+  `command_enable_phase_stepping` and
+  `command_set_phase_stepping_direction` both consult it when
+  re-arming `current_lut`.
 
 ### Changes from Original Plan
 
@@ -516,7 +557,7 @@ together. Calibration last since it depends on everything else working.
 | ISR frequency: 10 kHz → 1 kHz | Stability; 1 ms tick sufficient for phase tracking at rest | Original §C |
 | Protocol: `load_phase_lut` now chunked | `PT_buffer.encode()` uses uint8 for length (256 max); total LUT data (512 bytes) sent in 200B chunks with `offset=%hu` field | Original §B |
 | Python: `_enable` uses dwell(0.5s) | Serial queue flush between LUT chunks and ISR enable; prevents MCU buffer overflow | — |
-| Python: `_build_phase_cmds` called directly | Config callback timing issue; `enable_cmd`/`load_lut_cmd` must be available before first `PHASE_STEPPING_ENABLE` | Original §WI 2 |
+| `configure_phase_stepping` registered via `mcu.register_config_callback` (not `klippy:connect`) | Multi-stepper fix — see "Multi-stepper support" above | — |
 | `stepper_get_position_by_oid()`: added NULL guard | Prevent hard fault if stepper OID is invalid during ISR | Original §WI 5 |
 | MCU: removed `sched_add_timer` from enable handler | Crashed MCU; timer started at boot via `DECL_INIT` instead | — |
 
@@ -537,16 +578,12 @@ together. Calibration last since it depends on everything else working.
 
 ### Next Steps
 
-1. **Debug multi-stepper crash** — investigate OID allocation for second stepper:
-   - Check OI_MAX and OID pool usage on the MCU
-   - Add diagnostic logging for `configure_phase_stepping` OID values
-   - Verify `add_config_cmd` delivery for second stepper
-   - Test with `register_config_callback` + runtime send instead of config command
-2. **Restore ISR to 10 kHz** once multi-stepper stability is confirmed
-3. **Restore LUT to 1024 entries** using static BSS allocation (see fix plan below)
-4. **Wire up `_handle_dir_inverted`** for forward/backward LUT swapping
-5. **Test calibration pipeline** (`PHASE_STEPPING_CALIBRATE`) with accelerometer
-6. **Restore `_disable` flow** (restore TMC mode, rotation distance, etc.)
+1. Wire `_handle_dir_inverted` to swap `current_lut` between forward / backward LUTs (or set a direction flag the ISR reads)
+2. Restore `_disable` flow — call `restore_phase_stepping_mode` on the TMC, undo the rotation-distance change, gate the ISR enable
+3. Restore ISR to 10 kHz (multistepper is now stable; original `REFRESH_FREQ` constant)
+4. Restore LUT to 1024 entries — move `phase_shift_lut` out of the heap-allocated `phase_stepper` struct into a static BSS array (`static int8_t phase_shift_luts[MAX_PHASE_STEPPERS][2][1024]`)
+5. Test `PHASE_STEPPING_CALIBRATE` end-to-end with the ADXL345
+6. Update this doc's Implementation Status table after each completed step
 
 ---
 

@@ -42,6 +42,7 @@ struct phase_stepper {
     int8_t phase_shift_lut[LUT_SIZE];
     int8_t phase_shift_lut_bwd[LUT_SIZE];
     int8_t *current_lut;
+    uint8_t forward;            // 1 = use phase_shift_lut, 0 = use _bwd
     uint16_t motor_phase;
     uint16_t driver_phase;
     int32_t zero_rotor_phase;
@@ -155,6 +156,7 @@ command_configure_phase_stepping(uint32_t *args)
         ps->phase_shift_lut_bwd[i] = 0;
     }
     ps->current_lut = ps->phase_shift_lut;
+    ps->forward = 1;
     ps->motor_phase = 0;
     ps->driver_phase = 0;
     ps->enabled = 0;
@@ -203,11 +205,29 @@ command_enable_phase_stepping(uint32_t *args)
     if (ps->enabled) {
         ps->motor_phase = 0;
         ps->driver_phase = 0;
-        ps->current_lut = ps->phase_shift_lut;
+        ps->current_lut = ps->forward ? ps->phase_shift_lut
+                                       : ps->phase_shift_lut_bwd;
     }
 }
 DECL_COMMAND(command_enable_phase_stepping,
              "enable_phase_stepping oid=%c enable=%c");
+
+void
+command_set_phase_stepping_direction(uint32_t *args)
+{
+    uint8_t oid = args[0];
+    struct phase_stepper *ps = oid_lookup(oid, command_configure_phase_stepping);
+    if (!ps)
+        return;
+    uint8_t forward = args[1] ? 1 : 0;
+    if (ps->forward == forward)
+        return;
+    ps->forward = forward;
+    ps->current_lut = forward ? ps->phase_shift_lut
+                              : ps->phase_shift_lut_bwd;
+}
+DECL_COMMAND(command_set_phase_stepping_direction,
+             "set_phase_stepping_direction oid=%c forward=%c");
 
 // ---- Init ----
 

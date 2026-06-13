@@ -98,7 +98,7 @@ class PhaseStepping:
 
         self.printer.register_event_handler("klippy:mcu_identify",
                                              self._handle_mcu_identify)
-        self.printer.register_event_handler("stepper:set_sdir_inverted",
+        self.printer.register_event_handler("stepper:set_dir_inverted",
                                              self._handle_dir_inverted)
 
         gcode = self.printer.lookup_object("gcode")
@@ -184,6 +184,8 @@ class PhaseStepping:
             "load_phase_lut oid=%c offset=%hu data=%*s", cq=self._lut_cq)
         self.enable_cmd = mcu.lookup_command(
             "enable_phase_stepping oid=%c enable=%c", cq=self._enable_cq)
+        self.direction_cmd = mcu.lookup_command(
+            "set_phase_stepping_direction oid=%c forward=%c", cq=self._enable_cq)
 
     def _send_lut_init(self):
         pass
@@ -203,7 +205,14 @@ class PhaseStepping:
                 [self.phase_oid, off, list(data[off:off + chunk])])
 
     def _handle_dir_inverted(self, stepper):
-        pass
+        if stepper is not self.stepper or self.direction_cmd is None:
+            return
+        # get_dir_inverted returns (current, original). We use the
+        # current setting: if inverted, kinematics-level forward
+        # commands map to motor-level reverse, so the backward LUT
+        # captures the correct phase correction.
+        invert, _ = self.stepper.get_dir_inverted()
+        self.direction_cmd.send([self.phase_oid, 0 if invert else 1])
 
     def _sync_phase_offset(self):
         if self.tmc_module is None or self.stepper is None:
@@ -231,6 +240,11 @@ class PhaseStepping:
     def _enable_stripped(self, print_time):
         if not self.enable_cmd:
             return
+        # Push current stepper dir inversion to the MCU so the right
+        # LUT (forward vs backward) is selected from the first tick.
+        if self.direction_cmd is not None:
+            invert, _ = self.stepper.get_dir_inverted()
+            self.direction_cmd.send([self.phase_oid, 0 if invert else 1])
         self.enable_cmd.send([self.phase_oid, 1])
 
         rot_dist, steps_per_rot = self.stepper.get_rotation_distance()
