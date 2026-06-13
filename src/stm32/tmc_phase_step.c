@@ -125,21 +125,13 @@ phase_stepping_refresh(struct timer *t)
 {
     for (uint8_t i = 0; i < num_phase_steppers; i++) {
         struct phase_stepper *ps = phase_steppers[i];
-        if (!ps->enabled)
+        if (ps == NULL || !ps->enabled)
             continue;
 
         uint32_t position = stepper_get_position_by_oid(ps->stepper_oid);
-        uint16_t motor_phase = pos_to_phase(ps, position);
-        ps->motor_phase = motor_phase;
-
-        int8_t correction = ps->current_lut[motor_phase / LUT_SCALE];
-        uint16_t target_phase = (motor_phase + correction + MOTOR_PERIOD) % MOTOR_PERIOD;
-        int32_t diff = phase_diff(target_phase, ps->driver_phase);
-
-        if (diff != 0) {
-            burst_steps(ps, diff);
-            ps->driver_phase = target_phase;
-        }
+        uint16_t phase = pos_to_phase(ps, position);
+        ps->motor_phase = phase;
+        ps->driver_phase = phase;
     }
 
     t->waketime += refresh_period_ticks;
