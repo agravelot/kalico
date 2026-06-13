@@ -49,8 +49,7 @@ struct phase_stepper {
     uint32_t dir_reset_mask;
     int8_t *current_lut;
     uint8_t forward;            // 1 = forward LUT, 0 = backward LUT
-    uint16_t motor_phase;
-    uint16_t driver_phase;
+    int32_t last_burst_step_count; // step-count (signed) at which we last burst
     int32_t zero_rotor_phase;
     uint32_t steps_per_period;
     uint8_t enabled;
@@ -66,30 +65,24 @@ static uint_fast8_t phase_stepping_refresh(struct timer *t);
 
 // ---- Helpers ----
 
-// Compute motor electrical phase from stepper position.
-// Position from stepper_get_position() has a POSITION_BIAS offset (0x40000000)
-// representing zero physical steps.
+// Convert a raw stepper position (from stepper_get_position_by_oid,
+// which includes POSITION_BIAS = 0x40000000) into a signed step count.
+// Positive = forward (matches Klippy's mcu_pos convention).
+static inline int32_t
+pos_to_step_count(uint32_t position)
+{
+    return (int32_t)(position - 0x40000000);
+}
+
+// Compute motor electrical phase from a raw stepper position.
 static inline uint16_t
 pos_to_phase(struct phase_stepper *ps, uint32_t position)
 {
-    // phase = ((position - POSITION_BIAS) * MOTOR_PERIOD / steps_per_period
-    //          + zero_rotor_phase) % MOTOR_PERIOD
-    uint32_t step_count = position - 0x40000000;
-    uint32_t phase = ((uint64_t)step_count * MOTOR_PERIOD) / ps->steps_per_period;
+    int32_t step_count = pos_to_step_count(position);
+    uint32_t phase = ((uint64_t)(uint32_t)step_count * MOTOR_PERIOD)
+                     / ps->steps_per_period;
     phase = (phase + ps->zero_rotor_phase) % MOTOR_PERIOD;
     return (uint16_t)phase;
-}
-
-// Compute phase difference, wrapped to [-MOTOR_PERIOD/2, MOTOR_PERIOD/2)
-static inline int32_t
-phase_diff(uint16_t target, uint16_t current)
-{
-    int32_t diff = (int32_t)target - (int32_t)current;
-    if (diff > MOTOR_PERIOD / 2)
-        diff -= MOTOR_PERIOD;
-    else if (diff < -MOTOR_PERIOD / 2)
-        diff += MOTOR_PERIOD;
-    return diff;
 }
 
 // Write direction pin for an axis
@@ -105,7 +98,7 @@ set_direction(struct phase_stepper *ps, uint8_t forward)
 
 // Burst step pulses for a phase correction difference
 // 'diff' is in microsteps (signed). Positive = forward, negative = backward.
-static void __attribute__((unused))
+static void
 burst_steps(struct phase_stepper *ps, int32_t diff)
 {
     if (diff == 0)
@@ -123,16 +116,62 @@ burst_steps(struct phase_stepper *ps, int32_t diff)
     }
 }
 
-// ---- Periodic refresh callback ----
+// ---- Periodic refresh callback (10 kHz) ----
 
+// Klippy's normal stepper driver also writes to the TMC step pin, so
+// the MCU must NOT replicate every step pulse — only the LUT-derived
+// correction. We track the last step-count at which we bursted
+// corrections, and for each new planned step we look up the LUT entry
+// at the corresponding electrical phase and fire that many (positive or
+// negative) extra pulses. Total TMC steps per planned step =
+// 1 (Klippy) + lut[phase] (ISR).
 static uint_fast8_t
 phase_stepping_refresh(struct timer *t)
 {
-    uint8_t i;
-    for (i = 0; i < num_phase_steppers; i++) {
-        if (phase_steppers[i] && phase_steppers[i]->enabled)
-            break;
+    for (uint8_t i = 0; i < num_phase_steppers; i++) {
+        struct phase_stepper *ps = phase_steppers[i];
+        if (!ps || !ps->enabled)
+            continue;
+
+        uint32_t position = stepper_get_position_by_oid(ps->stepper_oid);
+        int32_t step_count = pos_to_step_count(position);
+        int32_t step_delta = step_count - ps->last_burst_step_count;
+
+        if (step_delta == 0)
+            continue;
+
+        // Cap the burst to a sane per-tick budget so a long move that
+        // spans several ticks doesn't try to fire 1000 pulses in 100 us.
+        // The remaining steps get bursted on subsequent ticks.
+        if (step_delta > 32)
+            step_delta = 32;
+        else if (step_delta < -32)
+            step_delta = -32;
+
+        int32_t sign = step_delta > 0 ? 1 : -1;
+        uint32_t count = (uint32_t)(step_delta > 0 ? step_delta : -step_delta);
+        int32_t total_burst = 0;
+
+        for (uint32_t k = 0; k < count; k++) {
+            int32_t step_pos_signed = ps->last_burst_step_count
+                                      + sign * (int32_t)(k + 1);
+            uint16_t phase = pos_to_phase(
+                ps, (uint32_t)(int32_t)(step_pos_signed + 0x40000000));
+            int8_t correction = ps->current_lut[phase];
+            // For backward moves, reverse the correction sign so the
+            // physical microstep advances MSCNT in the right sense.
+            if (sign < 0)
+                correction = (int8_t)(-correction);
+            if (correction != 0)
+                total_burst += correction;
+        }
+
+        ps->last_burst_step_count += sign * (int32_t)count;
+
+        if (total_burst != 0)
+            burst_steps(ps, total_burst);
     }
+
     t->waketime += refresh_period_ticks;
     return SF_RESCHEDULE;
 }
@@ -164,8 +203,7 @@ command_configure_phase_stepping(uint32_t *args)
     }
     ps->current_lut = phase_shift_luts[ps->lut_index][0];
     ps->forward = 1;
-    ps->motor_phase = 0;
-    ps->driver_phase = 0;
+    ps->last_burst_step_count = 0;
     ps->enabled = 0;
     phase_steppers[num_phase_steppers++] = ps;
 }
@@ -210,8 +248,8 @@ command_enable_phase_stepping(uint32_t *args)
     ps->enabled = args[1] ? 1 : 0;
 
     if (ps->enabled) {
-        ps->motor_phase = 0;
-        ps->driver_phase = 0;
+        ps->last_burst_step_count = pos_to_step_count(
+            stepper_get_position_by_oid(ps->stepper_oid));
         ps->current_lut = phase_shift_luts[ps->lut_index][ps->forward ? 0 : 1];
     }
 }
