@@ -123,6 +123,11 @@ burst_steps(struct phase_stepper *ps, int32_t diff)
 static uint_fast8_t
 phase_stepping_refresh(struct timer *t)
 {
+    uint8_t i;
+    for (i = 0; i < num_phase_steppers; i++) {
+        if (phase_steppers[i] && phase_steppers[i]->enabled)
+            break;
+    }
     t->waketime += refresh_period_ticks;
     return SF_RESCHEDULE;
 }
