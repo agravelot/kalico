@@ -104,14 +104,6 @@ class CalibrateAxis:
         accel_chip = self.printer.lookup_object(accel_chip_name.strip())
         return toolhead, accel_chip
 
-    def _move_to_start(self, toolhead, print_time):
-        toolhead.wait_moves()
-        kin = toolhead.get_kinematics()
-        X, Y, Z, E = toolhead.get_position()
-        # Move to center-ish for sweep
-        pos = [X, Y, Z, E]
-        toolhead.manual_move(pos, 100.0)
-
     def _compute_electrical_speed(self, rev_per_s, motor_steps=200):
         # Electrical frequency in Hz = rev/s * pole_pairs
         return rev_per_s * motor_steps / 2  # 50 pole pairs for 200-step motor

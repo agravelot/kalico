@@ -53,9 +53,6 @@ class MotorPhaseCorrection:
     def get_harmonic(self, n):
         return self.items[n]
 
-    def is_empty(self):
-        return all(m == 0.0 for m, _ in self.items[1:])
-
     def build_phase_shift(self):
         lut = [0.0] * LUT_SIZE
         for n in range(1, len(self.items)):
@@ -75,7 +72,8 @@ class MotorPhaseCorrection:
 class PhaseStepping:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.name = config.get_name().split()[-1]
+        self._config_section = config.get_name()
+        self.name = self._config_section.split()[-1]
         self.stepper_name = self.name
         self.stepper = None
         self.tmc_module = None
@@ -144,6 +142,13 @@ class PhaseStepping:
             mag, pha = corr.get_harmonic(n)
             raw += struct.pack("ff", mag, pha)
         return base64.b64encode(raw).decode()
+
+    def _save_corrections(self):
+        configfile = self.printer.lookup_object("configfile")
+        configfile.set(self._config_section, "correction_forward",
+                       self._serialize_correction(self.correction_fwd))
+        configfile.set(self._config_section, "correction_backward",
+                       self._serialize_correction(self.correction_bwd))
 
     def _handle_mcu_identify(self):
         force_move = self.printer.lookup_object("force_move")
@@ -333,7 +338,9 @@ class PhaseStepping:
         self.correction_fwd = MotorPhaseCorrection()
         self.correction_bwd = MotorPhaseCorrection()
         self._send_lut()
-        gcmd.respond_info("Phase stepping corrections reset for %s"
+        self._save_corrections()
+        gcmd.respond_info("Phase stepping corrections reset for %s.\n"
+                          "Run SAVE_CONFIG to persist to printer.cfg."
                           % self.stepper_name)
 
     cmd_PHASE_STEPPING_STATUS_help = "Show phase stepping status and corrections"
@@ -352,6 +359,10 @@ class PhaseStepping:
         from . import phase_stepping_calibration
         cal = phase_stepping_calibration.CalibrateAxis(self)
         cal.calibrate(gcmd)
+        self._save_corrections()
+        gcmd.respond_info(
+            "Calibration complete for %s. Run SAVE_CONFIG to persist"
+            " the corrections to printer.cfg." % self.stepper_name)
 
     cmd_PHASE_STEPPING_SET_HARMONIC_help = (
         "Set a single correction harmonic. Usage: SET_HARMONIC H=<n>"
@@ -366,7 +377,9 @@ class PhaseStepping:
                 else self.correction_bwd)
         corr.set_harmonic(h, mag, pha)
         self._send_lut()
-        gcmd.respond_info("Set harmonic %d: mag=%.4f pha=%.4f (%s) for %s"
+        self._save_corrections()
+        gcmd.respond_info("Set harmonic %d: mag=%.4f pha=%.4f (%s) for %s.\n"
+                          "Run SAVE_CONFIG to persist to printer.cfg."
                           % (h, mag, pha, direction, self.stepper_name))
 
 
