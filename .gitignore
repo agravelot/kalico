@@ -24,3 +24,11 @@ env/
 venv/
 mkdocs-env/
 logs/
+klippy/extras/beacon.py
+klippy/extras/auto_speed.py
+klippy/extras/autospeed/
+klippy/extras/autotune_tmc.py
+klippy/extras/motor_constants.py
+klippy/extras/motor_database.cfg
+klippy/extras/shaketune/
+klippy/extras/z_calibration.py
