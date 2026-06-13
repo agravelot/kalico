@@ -2,10 +2,12 @@
 set -u
 
 FORCE=false
+NO_FLASH=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --force|-f) FORCE=true; shift ;;
-    *) echo "Usage: $0 [--force|-f]"; exit 1 ;;
+    --no-flash|-n) NO_FLASH=true; shift ;;
+    *) echo "Usage: $0 [--force|-f] [--no-flash|-n]"; exit 1 ;;
   esac
 done
 
@@ -15,6 +17,12 @@ API="http://${REMOTE_HOST}:7125"
 API_KEY="1d2407061bfc461a8fe49a1e05466236"
 CURL="curl -sf -H X-Api-Key:${API_KEY}"
 WAIT_MAX=60
+
+# State file: tracks the last commit that was successfully pushed to the
+# printer. Used to decide whether to (a) build & flash firmware, (b) restart
+# Klippy, or (c) do nothing.
+STATE_DIR="$(dirname "$(readlink -f "$0")")/.iter-state"
+LAST_PUSH_FILE="$STATE_DIR/last-push"
 
 wait_klipper() {
   for i in $(seq 1 $WAIT_MAX); do
@@ -58,48 +66,110 @@ send_gcode() {
     -d "{\"script\": \"$1\"}" >/dev/null 2>&1
 }
 
-echo "  Push...${FORCE:+ (force)}"
+record_last_push() {
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  git rev-parse HEAD > "$LAST_PUSH_FILE"
+}
+
+last_pushed_commit() {
+  [ -f "$LAST_PUSH_FILE" ] || return 1
+  cat "$LAST_PUSH_FILE"
+  return 0
+}
+
+# Decide what needs to happen this run.
+HEAD=$(git rev-parse HEAD)
+LAST=$(last_pushed_commit 2>/dev/null || echo "")
+echo "  HEAD:  ${HEAD:0:12}"
+[ -n "$LAST" ] && echo "  last:  ${LAST:0:12}"
+
+# What changed since the last push?
+NEED_RSYNC=false
+NEED_FLASH=false
+NEED_RESTART=false
+
+if $FORCE; then
+  echo "  Force: rsync + flash + restart"
+  NEED_RSYNC=true
+  NEED_FLASH=true
+  NEED_RESTART=true
+elif [ -z "$LAST" ] || [ "$HEAD" != "$LAST" ]; then
+  NEED_RSYNC=true
+  NEED_RESTART=true
+  if [ -z "$LAST" ]; then
+    echo "  No last-push state - first run, will rsync + restart + flash"
+    NEED_FLASH=true
+  else
+    # C changed since last push?
+    if ! git diff --quiet "$LAST" HEAD -- src/ 2>/dev/null; then
+      NEED_FLASH=true
+      echo "  src/ changed since ${LAST:0:8} - will rebuild + flash"
+    else
+      echo "  src/ unchanged since ${LAST:0:8} - skipping C build"
+    fi
+    # Any tracked file changed?
+    if git diff --quiet "$LAST" HEAD 2>/dev/null; then
+      # HEAD changed but no diff (e.g. amended, rebased) - restart
+      # anyway to make sure printer picks up the new code
+      echo "  HEAD moved (no tracked diff) - will restart Klippy"
+    else
+      CHANGED=$(git diff --name-only "$LAST" HEAD 2>/dev/null | wc -l)
+      echo "  $CHANGED file(s) changed - will rsync + restart"
+    fi
+  fi
+else
+  echo "  No changes since last push - nothing to do"
+fi
+
+# Uncommitted local changes? Always rsync + restart so the printer
+# picks up the working tree state, even if HEAD already matches.
+UNCOMMITTED_C=false
+UNCOMMITTED_OTHER=false
+if ! git diff --quiet HEAD -- src/ 2>/dev/null; then
+  UNCOMMITTED_C=true
+fi
+if ! git diff --quiet HEAD 2>/dev/null; then
+  UNCOMMITTED_OTHER=true
+fi
+
+if $UNCOMMITTED_C || $UNCOMMITTED_OTHER; then
+  NEED_RSYNC=true
+  NEED_RESTART=true
+  if $UNCOMMITTED_C; then
+    NEED_FLASH=true
+    echo "  Uncommitted C changes - will rebuild + flash"
+  else
+    echo "  Uncommitted non-C changes - will rsync + restart"
+  fi
+fi
+
+if $NO_FLASH; then
+  echo "  --no-flash: skipping firmware flash"
+  NEED_FLASH=false
+fi
+
+if ! $NEED_RSYNC && ! $NEED_FLASH && ! $NEED_RESTART; then
+  echo "  all good (no changes)"
+  exit 0
+fi
+
+echo "  Push..."
 # Sync entire kalico repo to printer's klipper directory
 RSYNC_OPTS="-rlpt"
 rsync -e "ssh -o StrictHostKeyChecking=no" $RSYNC_OPTS \
   --exclude='.git/' --exclude='logs/' --exclude='out/' --exclude='__pycache__/' \
+  --exclude='.iter-state/' \
   ~/lab/kalico/ \
   "${REMOTE_USER}@${REMOTE_HOST}:~/klipper/" || exit 1
 
-# C code - use rsync for efficient incremental file transfer
-echo "  Checking for C changes..."
-DO_BUILD=false
-if $FORCE; then
-  DO_BUILD=true
-  echo "  Force recompile..."
-elif ! git diff --quiet HEAD -- src/ 2>/dev/null; then
-  DO_BUILD=true
-  echo "  C code changed - using rsync to update printer build dir..."
-else
-  echo "  No C changes detected"
-fi
-
-if $DO_BUILD; then
+if $NEED_FLASH; then
+  echo "  C build + flash..."
 
   PRINTER_KLIPPER="~/klipper"
-  LOCAL_SRC="$(pwd)/src" # ~/lab/kalico/src on home machine
   REMOTE_SRC="$PRINTER_KLIPPER/src"
-
-  echo "  Syncing changed files from $LOCAL_SRC to $REMOTE_SRC..."
-  # Use rsync with --update flag - only copies newer or missing files
-  # This is much faster than scp for incremental updates
-  rsync -e "ssh -o StrictHostKeyChecking=no" \
-    --update \
-    -r \
-    "$LOCAL_SRC/" \
-    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_SRC}/"
-
-  # Small delay to ensure filesystem sync
-  sleep 0.5
 
   # Determine board type - use octopus for Voron2
   CONFIG_FILE="../voron2-config/scripts/octopus.config"
-
   PRINTER_CFG="~/printer_data/config/scripts/$(basename $CONFIG_FILE .config).config"
 
   # Always sync config and run olddefconfig for consistent builds
@@ -117,17 +187,23 @@ if $DO_BUILD; then
       -d '{"script":"FIRMWARE_RESTART"}' >/dev/null 2>&1
     wait_klipper || exit 1
   fi
+  # The post-flash Klippy start counts as the restart.
+  NEED_RESTART=false
 fi
 
-echo "  Restart..."
-# Rollover klippy.log via Moonraker API to avoid log pollution
-$CURL -X POST "$API/server/logs/rollover" \
-  -H "Content-Type: application/json" \
-  -d '{"application": "klipper"}' >/dev/null 2>&1 || true
-$CURL -X POST "$API/printer/gcode/script" \
-  -H "Content-Type: application/json" \
-  -d '{"script":"FIRMWARE_RESTART"}' >/dev/null 2>&1
-wait_klipper || exit 1
+if $NEED_RESTART; then
+  echo "  Restart Klippy..."
+  $CURL -X POST "$API/server/logs/rollover" \
+    -H "Content-Type: application/json" \
+    -d '{"application": "klipper"}' >/dev/null 2>&1 || true
+  $CURL -X POST "$API/printer/gcode/script" \
+    -H "Content-Type: application/json" \
+    -d '{"script":"FIRMWARE_RESTART"}' >/dev/null 2>&1
+  wait_klipper || exit 1
+fi
+
+record_last_push
+
 echo "  _CG28..."
 send_gcode "_CG28"
 sleep 1

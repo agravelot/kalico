@@ -24,6 +24,7 @@ env/
 venv/
 mkdocs-env/
 logs/
+.iter-state/
 klippy/extras/beacon.py
 klippy/extras/auto_speed.py
 klippy/extras/autospeed/
