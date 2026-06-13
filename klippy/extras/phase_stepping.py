@@ -230,6 +230,8 @@ class PhaseStepping:
         self._sync_phase_offset()
         self._send_lut()
         logging.info("phase_stepping: lut sent for %s", self.stepper_name)
+        toolhead = self.printer.lookup_object("toolhead")
+        toolhead.dwell(0.5)
         if self.enable_cmd:
             self.enable_cmd.send([self.phase_oid, 1])
 
