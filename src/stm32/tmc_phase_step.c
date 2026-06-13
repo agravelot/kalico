@@ -125,7 +125,7 @@ phase_stepping_refresh(struct timer *t)
 {
     for (uint8_t i = 0; i < num_phase_steppers; i++) {
         struct phase_stepper *ps = phase_steppers[i];
-        if (ps == NULL || !ps->enabled)
+        if (!ps || !ps->enabled || !ps->stepper_oid)
             continue;
 
         uint32_t position = stepper_get_position_by_oid(ps->stepper_oid);
@@ -203,10 +203,8 @@ command_enable_phase_stepping(uint32_t *args)
     ps->enabled = args[1] ? 1 : 0;
 
     if (ps->enabled) {
-        // Reset phase tracking on enable
-        uint32_t position = stepper_get_position_by_oid(ps->stepper_oid);
-        ps->motor_phase = pos_to_phase(ps, position);
-        ps->driver_phase = ps->motor_phase;
+        ps->motor_phase = 0;
+        ps->driver_phase = 0;
         ps->current_lut = ps->phase_shift_lut;
     }
 }
