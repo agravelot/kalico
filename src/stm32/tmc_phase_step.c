@@ -53,7 +53,6 @@ static struct phase_stepper *phase_steppers[8];
 static uint8_t num_phase_steppers;
 static struct timer refresh_timer;
 static uint32_t refresh_period_ticks;
-static uint8_t timer_started;
 
 #define MAX_PHASE_STEPPERS 8
 
@@ -121,20 +120,9 @@ burst_steps(struct phase_stepper *ps, int32_t diff)
 
 // ---- Periodic refresh callback ----
 
-static volatile uint32_t isr_ticks;
-
 static uint_fast8_t
 phase_stepping_refresh(struct timer *t)
 {
-    uint8_t i;
-    struct phase_stepper *ps;
-    for (i = 0; i < num_phase_steppers; i++) {
-        ps = phase_steppers[i];
-        if (!ps || !ps->enabled)
-            continue;
-        isr_ticks++;
-    }
-
     t->waketime += refresh_period_ticks;
     return SF_RESCHEDULE;
 }
