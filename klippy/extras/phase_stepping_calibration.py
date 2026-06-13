@@ -237,84 +237,156 @@ class CalibrateAxis:
 
         return result
 
-    def _find_approx_mag(self, harmonic, speed, motor_steps,
-                         accelerometer, gcmd):
-        toolhead = self.printer.lookup_object("toolhead")
+    def _find_optimal(self, harmonic, speed, motor_steps,
+                      accelerometer, gcmd):
+        # Iterative 2D search: at each magnitude, sweep phase and find
+        # the phase that minimizes the harmonic response. Stop when
+        # increasing magnitude no longer reduces the response.
         min_mag = self.config.min_magnitude
         max_mag = self.config.max_magnitude
         quotient = self.config.magnitude_quotient
 
         best_mag = 0.0
-        best_min = float("inf")
+        best_pha = 0.0
+        best_response = float("inf")
         gone_worse = 0
         mag = min_mag
 
         while mag <= max_mag:
-            # Set trial correction
-            corr = self.ps.get_correction("forward")
-            corr.set_harmonic(harmonic, mag, 0.0)
-            self.ps.update_correction()
-
-            # Phase sweep at this magnitude
-            response = self._capture_param_sweep(
-                harmonic, speed, motor_steps, accelerometer, gcmd)
-
-            # Find minimum
-            if response:
-                min_val = min(response)
-                if min_val < best_min:
-                    best_min = min_val
-                    best_mag = mag
-                    gone_worse = 0
-                else:
-                    gone_worse += 1
-
-            if gone_worse >= 2:
-                break
+            pha, response = self._sweep_phase(
+                mag, speed, motor_steps, accelerometer, gcmd)
+            gcmd.respond_info("    mag=%.4f: best_pha=%.4f response=%.4f"
+                              % (mag, pha, response))
+            if response < best_response * 0.95:
+                best_response = response
+                best_mag = mag
+                best_pha = pha
+                gone_worse = 0
+            else:
+                gone_worse += 1
+                if gone_worse >= 2:
+                    break
             mag *= quotient
+        return best_mag, best_pha
 
-        return best_mag
-
-    def _capture_param_sweep(self, harmonic, speed, motor_steps,
-                             accelerometer, gcmd):
-        toolhead = self.printer.lookup_object("toolhead"
-                                              ).get_kinematics().rails[0]
-        aclient = accelerometer.start_internal_client()
-        # Do a small move at the target speed, capture samples
-        rev_pos = speed * 60.0 * 0.2  # 0.2s at this speed = ~1/5 rev
-        cur_pos = toolhead.get_tag_position()
-        # Move in +X (or whatever this stepper's rail is)
-        # We use the stepper's own rail, not the X axis
-        if not self.ps.stepper_name:
+    def _sweep_phase(self, mag, speed, motor_steps, accelerometer, gcmd):
+        # Host-driven phase sweep: for a fixed magnitude, run several
+        # constant-velocity moves with different correction phases and
+        # measure the harmonic response at each. The response curve
+        # over phase has a single minimum — that is the optimal phase.
+        n_phases = max(8, int(self.config.param_sweep_bins / 5))
+        toolhead = self.printer.lookup_object("toolhead")
+        force_move = self.printer.lookup_object("force_move")
+        stepper = force_move.lookup_stepper(self.ps.stepper_name)
+        # Move distance: 1 full revolution at the target speed.
+        # accel=0.0 makes it pure constant-velocity.
+        dist = 1.0
+        speed_mm_s = speed * motor_steps * (self.ps.rotation_distance
+                                            / motor_steps) / 60.0
+        # Convert rev/s to mm/s using the stepper's rotation_distance
+        # (1 rev = rotation_distance mm). Fall back to a default if
+        # the stepper doesn't expose it cleanly.
+        rot_dist = self._get_rotation_distance(stepper)
+        if rot_dist is not None:
+            speed_mm_s = speed * rot_dist
+        best_pha = 0.0
+        best_resp = float("inf")
+        results = []
+        for i in range(n_phases):
+            pha = 2.0 * math.pi * i / n_phases
+            corr = self.ps.get_correction("forward")
+            corr.set_harmonic(harmonic, mag, pha)
+            self.ps.update_correction()
+            aclient = accelerometer.start_internal_client()
+            stepper.manual_move(dist, speed_mm_s, accel=0.0)
+            toolhead.wait_moves()
             aclient.finish_measurements()
-            return []
-        # The phase_stepping object knows which stepper to drive:
-        # move it via its kinematics rail
-        from . import force_move
-        fm = self.printer.lookup_object("force_move")
-        stepper = fm.lookup_stepper(self.ps.stepper_name)
-        stepper.kin_add_move(cur_pos + rev_pos, speed * 60.0)
-        toolhead.wait_moves()
-        aclient.finish_measurements()
-        samples = aclient.get_samples()
-        if not samples:
-            return []
-        # Sum of squared X-axis accel as the magnitude proxy
-        n = len(samples)
-        if n < 2:
-            return []
-        # Use the first two samples to estimate rate
+            samples = aclient.get_samples()
+            if not samples:
+                results.append((pha, float("inf")))
+                continue
+            resp = self._dft_at_harmonic(
+                samples, speed, motor_steps, harmonic)
+            results.append((pha, resp))
+            if resp < best_resp:
+                best_resp = resp
+                best_pha = pha
+        # Fine search: ±π/n_phases around the coarse best, with the
+        # same number of points. Interpolate to sub-bin resolution.
+        fine_lo = best_pha - math.pi / n_phases
+        fine_hi = best_pha + math.pi / n_phases
+        for i in range(n_phases):
+            pha = fine_lo + (fine_hi - fine_lo) * i / (n_phases - 1)
+            corr.set_harmonic(harmonic, mag, pha)
+            self.ps.update_correction()
+            aclient = accelerometer.start_internal_client()
+            stepper.manual_move(dist, speed_mm_s, accel=0.0)
+            toolhead.wait_moves()
+            aclient.finish_measurements()
+            samples = aclient.get_samples()
+            if not samples:
+                continue
+            resp = self._dft_at_harmonic(
+                samples, speed, motor_steps, harmonic)
+            if resp < best_resp:
+                best_resp = resp
+                best_pha = pha
+        return best_pha, best_resp
+
+    def _get_rotation_distance(self, stepper):
+        try:
+            rot_dist, _ = stepper.get_rotation_distance()
+            return rot_dist
+        except Exception:
+            return None
+
+    def _dft_at_harmonic(self, samples, speed, motor_steps, harmonic):
+        # Compute the magnitude of the sliding-window DFT at the
+        # analysis frequency f = speed * motor_steps/2 * harmonic
+        # (electrical frequency × harmonic number, in Hz).
+        if len(samples) < 2:
+            return float("inf")
         dt = samples[1][0] - samples[0][0]
-        if dt > 0:
-            sample_rate = 1.0 / dt
-        else:
-            sample_rate = DEFAULT_ACCEL_SAMPLE_RATE
-        mag_sum = sum(s[1] * s[1] + s[2] * s[2] + s[3] * s[3]
-                      for s in samples)
-        # Return a list of (phase_value, magnitude) for the optimizer
-        # to search. Since we don't have the full phase-sweep loop
-        # here, return a single-point list as a smoke-test stub.
-        return [math.sqrt(mag_sum / n)]
+        if dt <= 0:
+            return float("inf")
+        sample_rate = 1.0 / dt
+        analysis_freq = speed * motor_steps / 2.0 * harmonic
+        if analysis_freq >= sample_rate / 2.0:
+            return float("inf")
+        # Use a 100ms sliding window. The window should cover an
+        # integer number of motor periods to avoid spectral leakage.
+        window_s = self.config.window_size
+        window_samples = max(3, int(window_s * sample_rate))
+        if window_samples % 2 == 0:
+            window_samples += 1
+        half = window_samples // 2
+        # Pre-multiply samples by sin/cos at the analysis frequency.
+        n = len(samples)
+        start_time = samples[0][0]
+        sin_vals = [0.0] * n
+        cos_vals = [0.0] * n
+        for i, s in enumerate(samples):
+            t = s[0] - start_time
+            phase = 2.0 * math.pi * analysis_freq * t
+            # Project onto the axis most relevant to this stepper.
+            accel = s[1] if self.ps.stepper_name.endswith("_x") else s[2]
+            sin_vals[i] = accel * math.sin(phase)
+            cos_vals[i] = accel * math.cos(phase)
+        # Sliding window sum. Skip the first and last `half` samples
+        # (no full window available). For each valid center, compute
+        # the integrated sin*sample and cos*sample over the window,
+        # then the magnitude. Return the median to be robust to
+        # transients at the start/end of the move.
+        mags = []
+        for center in range(half, n - half):
+            sin_sum = sum(sin_vals[center - half:center + half + 1])
+            cos_sum = sum(cos_vals[center - half:center + half + 1])
+            mags.append(math.sqrt(sin_sum * sin_sum + cos_sum * cos_sum)
+                        / window_samples)
+        if not mags:
+            return float("inf")
+        mags.sort()
+        return mags[len(mags) // 2]
 
     def calibrate(self, gcmd):
         toolhead, accel_chip = self._get_toolhead_and_accel(gcmd)
@@ -392,16 +464,16 @@ class CalibrateAxis:
             gcmd.respond_info("Calibrating harmonic %d at %.3f rev/s..."
                               % (h, speed))
 
-            mag = self._find_approx_mag(h, speed, motor_steps,
-                                        accel_chip, gcmd)
+            mag, pha = self._find_optimal(
+                h, speed, motor_steps, accel_chip, gcmd)
 
-            gcmd.respond_info("  Harmonic %d: best_mag=%.4f" % (h, mag))
+            gcmd.respond_info("  Harmonic %d: best_mag=%.4f best_pha=%.4f"
+                              % (h, mag, pha))
 
-            # Store correction (placeholder: just use found magnitude)
             corr_fwd = self.ps.get_correction("forward")
             corr_bwd = self.ps.get_correction("backward")
-            corr_fwd.set_harmonic(h, mag, 0.0)
-            corr_bwd.set_harmonic(h, mag, 0.0)
+            corr_fwd.set_harmonic(h, mag, pha)
+            corr_bwd.set_harmonic(h, mag, pha)
 
         self.ps.update_correction()
         gcmd.respond_info("Calibration complete for %s"
