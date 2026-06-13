@@ -170,6 +170,8 @@ command_load_phase_lut(uint32_t *args)
 {
     uint8_t oid = args[0];
     struct phase_stepper *ps = oid_lookup(oid, command_configure_phase_stepping);
+    if (!ps)
+        return;
     uint16_t offset = args[1];
     uint8_t data_len = args[2];
     uint8_t *data = command_decode_ptr(args[3]);
@@ -194,6 +196,8 @@ command_enable_phase_stepping(uint32_t *args)
 {
     uint8_t oid = args[0];
     struct phase_stepper *ps = oid_lookup(oid, command_configure_phase_stepping);
+    if (!ps)
+        return;
     ps->enabled = args[1] ? 1 : 0;
 
     if (ps->enabled) {
