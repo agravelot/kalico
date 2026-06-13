@@ -118,20 +118,20 @@ burst_steps(struct phase_stepper *ps, int32_t diff)
     }
 }
 
-// ---- Periodic refresh callback (10 kHz) ----
+// ---- Periodic refresh callback ----
+
+static volatile uint32_t isr_ticks;
 
 static uint_fast8_t
 phase_stepping_refresh(struct timer *t)
 {
-    for (uint8_t i = 0; i < num_phase_steppers; i++) {
-        struct phase_stepper *ps = phase_steppers[i];
-        if (!ps || !ps->enabled || !ps->stepper_oid)
+    uint8_t i;
+    struct phase_stepper *ps;
+    for (i = 0; i < num_phase_steppers; i++) {
+        ps = phase_steppers[i];
+        if (!ps || !ps->enabled)
             continue;
-
-        uint32_t position = stepper_get_position_by_oid(ps->stepper_oid);
-        uint16_t phase = pos_to_phase(ps, position);
-        ps->motor_phase = phase;
-        ps->driver_phase = phase;
+        isr_ticks++;
     }
 
     t->waketime += refresh_period_ticks;
@@ -207,19 +207,32 @@ command_enable_phase_stepping(uint32_t *args)
         ps->driver_phase = 0;
         ps->current_lut = ps->phase_shift_lut;
     }
+
+    if (!timer_started) {
+        uint8_t i;
+        for (i = 0; i < num_phase_steppers; i++) {
+            if (phase_steppers[i]->enabled) {
+                refresh_timer.waketime = timer_read_time() + refresh_period_ticks;
+                sched_add_timer(&refresh_timer);
+                timer_started = 1;
+                break;
+            }
+        }
+    }
 }
 DECL_COMMAND(command_enable_phase_stepping,
              "enable_phase_stepping oid=%c enable=%c");
 
 // ---- Init ----
 
+static uint8_t timer_started;
+
 void
 phase_stepping_init(void)
 {
     refresh_period_ticks = timer_from_us(1000000 / REFRESH_FREQ);
     refresh_timer.func = phase_stepping_refresh;
-    refresh_timer.waketime = timer_read_time() + refresh_period_ticks;
-    sched_add_timer(&refresh_timer);
+    timer_started = 0;
 }
 DECL_INIT(phase_stepping_init);
 
