@@ -208,18 +208,6 @@ command_enable_phase_stepping(uint32_t *args)
         ps->driver_phase = 0;
         ps->current_lut = ps->phase_shift_lut;
     }
-
-    if (!timer_started) {
-        uint8_t i;
-        for (i = 0; i < num_phase_steppers; i++) {
-            if (phase_steppers[i]->enabled) {
-                refresh_timer.waketime = timer_read_time() + refresh_period_ticks;
-                sched_add_timer(&refresh_timer);
-                timer_started = 1;
-                break;
-            }
-        }
-    }
 }
 DECL_COMMAND(command_enable_phase_stepping,
              "enable_phase_stepping oid=%c enable=%c");
@@ -231,7 +219,8 @@ phase_stepping_init(void)
 {
     refresh_period_ticks = timer_from_us(1000000 / REFRESH_FREQ);
     refresh_timer.func = phase_stepping_refresh;
-    timer_started = 0;
+    refresh_timer.waketime = timer_read_time() + refresh_period_ticks;
+    sched_add_timer(&refresh_timer);
 }
 DECL_INIT(phase_stepping_init);
 
