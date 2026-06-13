@@ -53,6 +53,7 @@ static struct phase_stepper *phase_steppers[8];
 static uint8_t num_phase_steppers;
 static struct timer refresh_timer;
 static uint32_t refresh_period_ticks;
+static uint8_t timer_started;
 
 #define MAX_PHASE_STEPPERS 8
 
@@ -100,7 +101,7 @@ set_direction(struct phase_stepper *ps, uint8_t forward)
 
 // Burst step pulses for a phase correction difference
 // 'diff' is in microsteps (signed). Positive = forward, negative = backward.
-static void
+static void __attribute__((unused))
 burst_steps(struct phase_stepper *ps, int32_t diff)
 {
     if (diff == 0)
@@ -224,8 +225,6 @@ DECL_COMMAND(command_enable_phase_stepping,
              "enable_phase_stepping oid=%c enable=%c");
 
 // ---- Init ----
-
-static uint8_t timer_started;
 
 void
 phase_stepping_init(void)
