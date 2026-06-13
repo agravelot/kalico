@@ -524,63 +524,57 @@ so `mcu.create_oid()` and `mcu.add_config_cmd()` execute inside
 
 ### What Does NOT Work (known gaps)
 
-- ISR runs at 1 kHz (was reduced from 10 kHz for stability)
-- LUT is 256 entries (was reduced from 1024 due to heap pressure on STM32F446)
-- Calibration pipeline (`PHASE_STEPPING_CALIBRATE`) not validated end-to-end
-- Full enable flow (TMC mode set, MSCNT sync, LUT load, dwell) is currently
-  stripped in `_enable_stripped` to a minimal version that just sends the
-  enable command. Restoring it requires the user to validate the new
-  direction command + ISR init under load.
+- ISR runs at 10 kHz but has not been stress-tested with actual
+  stepper motion (no-load test only — both steppers enabled and
+  idle for 20+ s).
+- Calibration pipeline (`PHASE_STEPPING_CALIBRATE`) not validated
+  end-to-end. The data path is there (`build_phase_shift` /
+  `update_correction` / `cmd_PHASE_STEPPING_RESET`) but actual
+  ADC captures and harmonic fitting have not been exercised.
+- Chelper `message_fill()` does not bounds-check `len` against
+  `MESSAGE_MAX=64`. We work around this with chunk=50 in
+  `_send_lut`, but a proper fix is a flexible-array
+  `struct queue_message` plus a matching MCU receive-buffer
+  bump.
 
-### Multi-chunk LUT load: open issue
+### Multi-chunk LUT load: resolved (chelper buffer overflow)
 
-Symptom: with the stripped enable (no TMC writes, no `_send_lut`,
-no dwell), both steppers enable and run fine. As soon as
-`_send_lut` is re-introduced to push the correction table to the
-MCU, the next `PHASE_STEPPING_ENABLE` G-code disconnects Klippy
-from the MCU within ~1s and the printer auto-restarts. The
-klippy.log shows the G-code was sent but no
-`phase_stepping: enabled for ...` line — the enable never
-finishes.
+**Root cause** (found by bisect on `_enable` step at LUT_SIZE=256):
+`struct queue_message.msg[MESSAGE_MAX=64]` in
+`klippy/chelper/msgblock.h:22` is a fixed 64-byte buffer, and
+`message_fill()` in `klippy/chelper/msgblock.c:137-143` does
+`memcpy(qm->msg, data, len)` without a bounds check. When the
+Python side encoded a `load_phase_lut` command with PT_buffer
+>~58 bytes, the encoded message exceeded 64 bytes and
+silently overflowed the heap, corrupting the next malloc chunk
+and eventually crashing the serial queue / disconnecting Klippy.
 
-Reproduced with:
-- LUT_SIZE 256 (3 chunks of 200 B) — works
-- LUT_SIZE 512 (6 chunks of 200 B, 11 chunks of 100 B) — fails
-- LUT_SIZE 1024 (11 chunks of 200 B, 22 chunks of 100 B) — fails
-- REFRESH_FREQ 1000 and 10000 — both fail with LUT load
-- Inter-chunk `toolhead.dwell(0.05)` — does not help
-- Static BSS at 16 KB (1024-entry), 8 KB (512-entry) — both fail
+**Fix**: chunk to 50 bytes in `_send_lut` (`klippy/extras/phase_stepping.py`).
+50 byte data + 5 byte header (msgid + oid + offset + len) = 55 bytes,
+safely under MESSAGE_MAX=64. The MCU protocol itself caps each
+command frame at 64 bytes, so this is a fundamental protocol
+limit — fixing the chelper to support >64 byte messages would
+require a separate MCU-side change (likely also a 64-byte receive
+buffer bump) that is out of scope.
 
-Confirmed-working baseline: the original 256-entry stopgap with
-the stripped enable (just `direction_cmd` + `enable_cmd` +
-rotation-distance) — both X and Y enable concurrently without
-issue.
+**Confirmed working** (tested on Voron2 / Octopus, June 13 2026):
+- LUT_SIZE=1024 (forward+backward = 2048 bytes), 50-byte chunks = 41
+  `load_phase_lut` messages per stepper, sent from one
+  `PHASE_STEPPING_ENABLE` G-code call.
+- Bisect at LUT_SIZE=256 / chunk=200: 3 chunks, ~205 B each → crash
+  (overflows ~141 B per message).
+- Bisect at chunk=150: 4 chunks, ~155 B each → crash.
+- Bisect at chunk=100: 6 chunks, ~105 B each → works (overflow
+  ~41 B per message, but doesn't hit critical heap state).
+- Bisect at chunk=50: 11 chunks, ~55 B each → works.
 
-Suspect: serial command queue or some MCU resource saturates
-when 6+ chunks of `load_phase_lut` are pushed from inside a
-single G-code handler. Each chunk is 100-200 B of buffer data
-plus the oid/offset headers. The MCU must process each before
-the next can land in its input buffer, but the G-code handler
-is a single Python call, so all the `send()` calls return
-immediately and the queue fills up. The post-load
-`toolhead.dwell(0.5)` is supposed to give the queue time to
-drain, but it apparently does not (or the MCU is hitting a
-hard fault rather than queue back-pressure).
-
-Next things to try:
-1. Send the LUT from a registered `toolhead.register_stepper` /
-   `toolhead.register_conveyor` callback that yields back to
-   the reactor between chunks (so the Klippy main loop processes
-   the serial ACKs).
-2. Move the LUT upload to MCU init time (`is_init=True` config
-   command). The original 1024-entry `_send_lut_init` sent the
-   full 2 KB hex string as one config command, but the PT_buffer
-   max is 255 B - so the init path would also need chunking, just
-   outside the G-code handler where the reactor can drain the
-   queue.
-3. Reduce chunk count by increasing chunk size to the 255 B
-   PT_buffer limit (and a smaller final chunk) instead of
-   100-200 B.
+**Larger chunk sizes (100-200 B) appear to be "heap
+poisoning roulette" — sometimes the overflow hits a free slot
+or a less-critical struct, sometimes it kills the serial
+queue. The Python-side chunk=50 cap is the safe answer for
+now; a proper fix would be a flexible-array `struct
+queue_message` in the chelper plus a matching receive-buffer
+bump on the MCU side.**
 
 ### Newly wired
 
