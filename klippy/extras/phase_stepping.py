@@ -98,8 +98,6 @@ class PhaseStepping:
 
         self.printer.register_event_handler("klippy:mcu_identify",
                                              self._handle_mcu_identify)
-        self.printer.register_event_handler("klippy:connect",
-                                             self._handle_connect)
         self.printer.register_event_handler("stepper:set_sdir_inverted",
                                              self._handle_dir_inverted)
 
@@ -151,9 +149,13 @@ class PhaseStepping:
             raise self.printer.config_error(
                 "phase_stepping requires a TMC5160 driver "
                 "for stepper '%s'" % (self.stepper_name,))
-
-    def _handle_connect(self):
-        self._build_phase_stepping_config()
+        # Register deferred config callback so the
+        # configure_phase_stepping command is sent with the rest
+        # of the MCU's config batch (mcu._send_config runs in
+        # klippy:connect which may be ordered after this module's
+        # klippy:connect handler).
+        self.stepper.get_mcu().register_config_callback(
+            self._build_phase_stepping_config)
 
     def _build_phase_stepping_config(self):
         mcu = self.stepper.get_mcu()
