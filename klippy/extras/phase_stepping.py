@@ -182,7 +182,6 @@ class PhaseStepping:
         self._lut_cq = mcu.alloc_command_queue()
         self._enable_cq = mcu.alloc_command_queue()
         self._build_phase_cmds()
-        self._send_lut_init()
 
     def _build_phase_cmds(self):
         mcu = self.stepper.get_mcu()
@@ -196,9 +195,6 @@ class PhaseStepping:
         self.zero_phase_cmd = mcu.lookup_command(
             "set_phase_stepping_zero_phase oid=%c zero_phase=%i",
             cq=self._enable_cq)
-
-    def _send_lut_init(self):
-        pass
 
     def _send_lut(self):
         if self.load_lut_cmd is None:
@@ -291,29 +287,6 @@ class PhaseStepping:
             rot_dist * new_steps / steps_per_rot)
         self.enabled = True
         logging.info("phase_stepping: enabled for %s", self.stepper_name)
-
-    def _enable_stripped(self, print_time):
-        # Stripped-down enable used while debugging the multi-chunk
-        # LUT load regression. Skips TMC mode set, MSCNT sync, LUT
-        # upload, and dwell — only the direction + enable commands
-        # are sent. Not for production use; see
-        # docs/phase_stepping_plan.md "Multi-chunk LUT load: open
-        # issue" for the test matrix.
-        if not self.enable_cmd:
-            return
-        if self.direction_cmd is not None:
-            invert, _ = self.stepper.get_dir_inverted()
-            self.direction_cmd.send([self.phase_oid, 0 if invert else 1])
-        self.enable_cmd.send([self.phase_oid, 1])
-
-        rot_dist, steps_per_rot = self.stepper.get_rotation_distance()
-        new_steps = self.full_steps * 256
-        self._saved_steps_per_rot = steps_per_rot
-        self.stepper.set_rotation_distance(
-            rot_dist * new_steps / steps_per_rot)
-        self.enabled = True
-        logging.info("phase_stepping: stripped enable for %s",
-                     self.stepper_name)
 
     def _disable(self, print_time):
         if self.phase_oid is None:
