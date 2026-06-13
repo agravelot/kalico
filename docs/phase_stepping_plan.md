@@ -484,7 +484,7 @@ together. Calibration last since it depends on everything else working.
 | WI 6 — Communications protocol | **Done** | `configure_phase_stepping`, `load_phase_lut` (chunked), `enable_phase_stepping` |
 | WI 7 — Build system & Kconfig | **Done** | `CONFIG_WANT_TMC_PHASE_STEP`, STM32 Makefile target |
 | WI 2 — Host phase stepping module | **Done** | `klippy/extras/phase_stepping.py` (~310 lines) |
-| WI 3 — Calibration module | **Skeleton** | `klippy/extras/phase_stepping_calibration.py` exists; G-code runs end-to-end, but `_capture_param_sweep` is a stub. Data path (correction→LUT→motion) verified via `PHASE_STEPPING_SET_HARMONIC` |
+| WI 3 — Calibration module | **Working** | `klippy/extras/phase_stepping_calibration.py`: real host-driven phase sweep with sliding-window DFT. Centering, displacement bounds, alternating direction. End-to-end verified: stepper_x found H1 mag=0.016 pha=5.9993, H3 mag=0.008 pha=0.7312; 10 round-trips at resonant speed with correction: LOST_STEPS=0, position stable |
 | WI 5 — Stepper integration | **Partial** | `stepper_get_position_by_oid()` exposed; rotation distance adjustment works |
 
 ### Multi-stepper support (fixed)
@@ -599,7 +599,7 @@ many extra pulses.
 
 ### What Does NOT Work (known gaps)
 
-- **Calibration algorithm is a smoke test**: the data path
+- ~~**Calibration algorithm is a smoke test**: the data path
   (correction → LUT → MCU → ISR burst → motion) is verified
   end-to-end via `PHASE_STEPPING_SET_HARMONIC`, but the
   actual `PHASE_STEPPING_CALIBRATE` G-code still has
@@ -616,7 +616,44 @@ many extra pulses.
   This is multi-week work; the G-code runs without crashing
   and the algorithm classes (`SlidingDftWindow`,
   `_chirp_dft_sweep`, `_find_peaks`, `_harmonic_fit`,
-  `_find_approx_mag`) are scaffolded.
+  `_find_approx_mag`) are scaffolded.~~ **Done**: real
+  host-driven phase sweep with sliding-window DFT at the
+  harmonic frequency. 2D search over (magnitude, phase) with
+  early termination on `gone_worse >= 2`. Verified end-to-end
+  on `stepper_x` at 9000 mm/min (resonant speed ~0.9 rev/s):
+  found H1 (mag=0.016, pha=5.9993 rad) and H3 (mag=0.008,
+  pha=0.7312 rad). 10 round-trips of 50mm with correction
+  applied: LOST_STEPS=0, position stable. The forward-
+  direction response is ~40 (after correction) and the
+  backward-direction response is ~120 — the residual
+  asymmetry between forward and backward indicates that
+  bidirectional calibration (separate forward and backward
+  LUTs) would yield further improvements; the current
+  implementation stores the same mag/pha in both directions
+  as a first cut.
+
+  **Algorithm**:
+  1. **Speed sweep** (Phase 1): toolhead-centered, single
+     stepper-driven move of up to 100mm via `force_move`.
+     Beacon samples at ~1300 Hz; sliding-window DFT at each
+     harmonic frequency peaks at the motor's resonance.
+  2. **2D search** (Phase 2): for each enabled harmonic, at
+     its resonant speed, iterate `mag` from `min_mag=0.008`
+     doubling by `quotient=2.0` until `max_mag=0.4`. At each
+     `mag`, do a phase sweep:
+     - Coarse: 80 trials (0.1 rev forward/backward alternating
+       moves) at phases 0, 2π/80, 4π/80, ..., with DFT at the
+       harmonic frequency projected onto the stepper's axis
+       (X for stepper_x, Y for stepper_y). Track best phase.
+     - Fine: 80 trials at ±π/80 around the coarse best, half
+       the move distance, same direction alternation.
+  3. **Displacement bound**: hard cap of 80mm from start
+     position. The phase sweep alternates direction every
+     trial so the toolhead oscillates within ±32mm of start.
+     On the very first run, we learned the hard way: 16
+     trials × 40mm/rev in the same direction = 640mm = crash.
+  4. **Early stop**: `gone_worse >= 2` consecutive mags
+     without improvement ends the search.
 - ~~**Burst rate vs TMC STEP input timing**: 32 steps × 127
   correction = 4064 BSRR pairs per 100 µs tick. The TMC
   needs ≥100 ns between pulses, but the burst loop blasts
