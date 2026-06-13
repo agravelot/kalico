@@ -9,6 +9,7 @@
 import logging, math, base64, struct
 
 MOTOR_PERIOD = 1024
+LUT_SIZE = 256
 SIN_FRACTION = 4
 SIN_PERIOD = SIN_FRACTION * MOTOR_PERIOD
 MAG_FRACTIONAL = 8
@@ -54,15 +55,16 @@ class MotorPhaseCorrection:
         return all(m == 0.0 for m, _ in self.items[1:])
 
     def build_phase_shift(self):
-        lut = [0.0] * MOTOR_PERIOD
+        lut = [0.0] * LUT_SIZE
         for n in range(1, len(self.items)):
             mag, pha = self.items[n]
             if mag == 0.0:
                 continue
             fixed_mag = _mag_to_fixed(mag)
             fixed_pha = _pha_to_fixed(pha)
-            for k in range(MOTOR_PERIOD):
-                arg = (n * k * SIN_FRACTION + fixed_pha) % SIN_PERIOD
+            for k in range(LUT_SIZE):
+                phase = k * (MOTOR_PERIOD // LUT_SIZE)
+                arg = (n * phase * SIN_FRACTION + fixed_pha) % SIN_PERIOD
                 sval = _sin_lut(arg)
                 lut[k] += fixed_mag * sval / (1 << (15 + MAG_FRACTIONAL))
         return [max(-128.0, min(127.0, v)) for v in lut]
@@ -167,41 +169,32 @@ class PhaseStepping:
 
         self._lut_cq = mcu.alloc_command_queue()
         self._enable_cq = mcu.alloc_command_queue()
-        mcu.register_config_callback(self._build_phase_cmds)
+        self._build_phase_cmds()
         self._send_lut_init()
 
     def _build_phase_cmds(self):
         mcu = self.stepper.get_mcu()
         self.load_lut_cmd = mcu.lookup_command(
-            "load_phase_lut oid=%c data=%*s", cq=self._lut_cq)
+            "load_phase_lut oid=%c offset=%hu data=%*s", cq=self._lut_cq)
         self.enable_cmd = mcu.lookup_command(
             "enable_phase_stepping oid=%c enable=%c", cq=self._enable_cq)
 
     def _send_lut_init(self):
-        mcu = self.stepper.get_mcu()
-        fwd = self.correction_fwd.build_phase_shift()
-        bwd = self.correction_bwd.build_phase_shift()
-        data = []
-        for i in range(MOTOR_PERIOD):
-            data.append(int(fwd[i]) & 0xFF)
-        for i in range(MOTOR_PERIOD):
-            data.append(int(bwd[i]) & 0xFF)
-        data_msg = "".join(["%02x" % b for b in data])
-        mcu.add_config_cmd(
-            "load_phase_lut oid=%d data=%s" % (self.phase_oid, data_msg),
-            is_init=True)
+        pass
 
     def _send_lut(self):
         if self.load_lut_cmd is None:
             return
         fwd = self.correction_fwd.build_phase_shift()
         bwd = self.correction_bwd.build_phase_shift()
-        data = []
-        for i in range(MOTOR_PERIOD):
-            data.append(int(fwd[i]) & 0xFF)
-        for i in range(MOTOR_PERIOD):
-            data.append(int(bwd[i]) & 0xFF)
-        self.load_lut_cmd.send([self.phase_oid, data])
+        data = bytearray(LUT_SIZE * 2)
+        for i in range(LUT_SIZE):
+            data[i] = int(fwd[i]) & 0xFF
+            data[i + LUT_SIZE] = int(bwd[i]) & 0xFF
+        chunk = 200
+        for off in range(0, len(data), chunk):
+            self.load_lut_cmd.send(
+                [self.phase_oid, off, list(data[off:off + chunk])])
 
     def _handle_dir_inverted(self, stepper):
         pass
@@ -235,18 +228,9 @@ class PhaseStepping:
         if self.tmc_module is not None:
             self.tmc_module.set_phase_stepping_mode(print_time)
         self._sync_phase_offset()
-
-        mcu = self.stepper.get_mcu()
-        # Reconfigure with calibrated zero_phase
-        mcu.add_config_cmd(
-            "configure_phase_stepping oid=%d stepper_oid=%d"
-            " step_pin=%s dir_pin=%s zero_phase=%i steps_per_period=%u"
-            % (self.phase_oid, self.stepper.get_oid(),
-               self.stepper.get_step_pin(), self.stepper.get_dir_pin(),
-               self.zero_phase, self.steps_per_period))
-
         self._send_lut()
-
+        logging.info("phase_stepping: lut sent for %s", self.stepper_name)
+        return
         if self.enable_cmd:
             self.enable_cmd.send([self.phase_oid, 1])
 

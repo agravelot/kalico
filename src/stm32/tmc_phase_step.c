@@ -24,6 +24,9 @@ DECL_CONSTANT("PHASE_STEPPING", 1);
 
 // Electrical period of Trinamic drivers (MSCNT range)
 #define MOTOR_PERIOD 1024
+// LUT granularity: 256 entries covering 1024 electrical phases
+#define LUT_SIZE 256
+#define LUT_SCALE (MOTOR_PERIOD / LUT_SIZE)
 // Refresh rate: 10 kHz = 100 µs period
 #define REFRESH_FREQ 10000
 
@@ -36,8 +39,8 @@ struct phase_stepper {
     uint32_t step_reset_mask;
     uint32_t dir_set_mask;
     uint32_t dir_reset_mask;
-    int8_t phase_shift_lut[MOTOR_PERIOD];
-    int8_t phase_shift_lut_bwd[MOTOR_PERIOD];
+    int8_t phase_shift_lut[LUT_SIZE];
+    int8_t phase_shift_lut_bwd[LUT_SIZE];
     int8_t *current_lut;
     uint16_t motor_phase;
     uint16_t driver_phase;
@@ -129,7 +132,7 @@ phase_stepping_refresh(struct timer *t)
         uint16_t motor_phase = pos_to_phase(ps, position);
         ps->motor_phase = motor_phase;
 
-        int8_t correction = ps->current_lut[motor_phase];
+        int8_t correction = ps->current_lut[motor_phase / LUT_SCALE];
         uint16_t target_phase = (motor_phase + correction + MOTOR_PERIOD) % MOTOR_PERIOD;
         int32_t diff = phase_diff(target_phase, ps->driver_phase);
 
@@ -161,7 +164,7 @@ command_configure_phase_stepping(uint32_t *args)
     ps->dir_reset_mask = ps->dir_pin.bit << 16;
     ps->zero_rotor_phase = args[4];
     ps->steps_per_period = args[5];
-    for (int i = 0; i < MOTOR_PERIOD; i++) {
+    for (int i = 0; i < LUT_SIZE; i++) {
         ps->phase_shift_lut[i] = 0;
         ps->phase_shift_lut_bwd[i] = 0;
     }
@@ -181,22 +184,24 @@ command_load_phase_lut(uint32_t *args)
 {
     uint8_t oid = args[0];
     struct phase_stepper *ps = oid_lookup(oid, command_configure_phase_stepping);
-    uint8_t data_len = args[1];
-    uint8_t *data = command_decode_ptr(args[2]);
+    uint16_t offset = args[1];
+    uint8_t data_len = args[2];
+    uint8_t *data = command_decode_ptr(args[3]);
 
-    uint16_t expected = MOTOR_PERIOD * 2;
-    if (data_len != expected) {
-        shutdown("phase_step: bad lut size");
+    if (offset + data_len > LUT_SIZE * 2) {
+        shutdown("phase_step: bad lut offset/size");
         return;
     }
 
-    for (uint16_t i = 0; i < MOTOR_PERIOD; i++) {
-        ps->phase_shift_lut[i] = (int8_t)data[i];
-        ps->phase_shift_lut_bwd[i] = (int8_t)data[i + MOTOR_PERIOD];
+    for (uint16_t i = 0; i < data_len; i++) {
+        if (offset + i < LUT_SIZE)
+            ps->phase_shift_lut[offset + i] = (int8_t)data[i];
+        else
+            ps->phase_shift_lut_bwd[offset + i - LUT_SIZE] = (int8_t)data[i];
     }
 }
 DECL_COMMAND(command_load_phase_lut,
-             "load_phase_lut oid=%c data=%*s");
+             "load_phase_lut oid=%c offset=%hu data=%*s");
 
 void
 command_enable_phase_stepping(uint32_t *args)

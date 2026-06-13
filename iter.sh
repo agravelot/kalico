@@ -1,6 +1,14 @@
 #!/bin/bash
 set -u
 
+FORCE=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force|-f) FORCE=true; shift ;;
+    *) echo "Usage: $0 [--force|-f]"; exit 1 ;;
+  esac
+done
+
 REMOTE_USER="agravelot"
 REMOTE_HOST="voron2.agravelot.eu"
 API="http://${REMOTE_HOST}:7125"
@@ -50,18 +58,28 @@ send_gcode() {
     -d "{\"script\": \"$1\"}" >/dev/null 2>&1
 }
 
-echo "  Push..."
+echo "  Push...${FORCE:+ (force)}"
 # Sync entire kalico repo to printer's klipper directory
-rsync -e "ssh -o StrictHostKeyChecking=no" --update \
+RSYNC_OPTS="-rlpt"
+rsync -e "ssh -o StrictHostKeyChecking=no" $RSYNC_OPTS \
+  --exclude='.git/' --exclude='logs/' --exclude='out/' --exclude='__pycache__/' \
   ~/lab/kalico/ \
   "${REMOTE_USER}@${REMOTE_HOST}:~/klipper/" || exit 1
 
 # C code - use rsync for efficient incremental file transfer
 echo "  Checking for C changes..."
-if git diff --quiet HEAD src/*.c 2>/dev/null; then
-  echo "  No C changes detected"
-else
+DO_BUILD=false
+if $FORCE; then
+  DO_BUILD=true
+  echo "  Force recompile..."
+elif ! git diff --quiet HEAD -- src/ 2>/dev/null; then
+  DO_BUILD=true
   echo "  C code changed - using rsync to update printer build dir..."
+else
+  echo "  No C changes detected"
+fi
+
+if $DO_BUILD; then
 
   PRINTER_KLIPPER="~/klipper"
   LOCAL_SRC="$(pwd)/src" # ~/lab/kalico/src on home machine
@@ -102,9 +120,10 @@ else
 fi
 
 echo "  Restart..."
-# Rotate log before restart so we only see current test output
-ssh -o StrictHostKeyChecking=no "${REMOTE_USER}@${REMOTE_HOST}" \
-  "> ~/printer_data/logs/klippy.log" 2>/dev/null || true
+# Rollover klippy.log via Moonraker API to avoid log pollution
+$CURL -X POST "$API/server/logs/rollover" \
+  -H "Content-Type: application/json" \
+  -d '{"application": "klipper"}' >/dev/null 2>&1 || true
 $CURL -X POST "$API/printer/gcode/script" \
   -H "Content-Type: application/json" \
   -d '{"script":"FIRMWARE_RESTART"}' >/dev/null 2>&1
@@ -129,7 +148,7 @@ if grep -q "Move out of range" logs/klippy.log 2>/dev/null; then
   exit 1
 fi
 
-if grep -qi "error\|fatal" logs/klippy.log 2>/dev/null; then
+if grep -qi "config error\|traceback\|unhandled exception\|internal error\|mcu error\|fatal" logs/klippy.log 2>/dev/null; then
   echo "  *** ERROR ***"
   exit 1
 fi

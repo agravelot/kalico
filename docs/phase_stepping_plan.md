@@ -522,3 +522,30 @@ src/stm32/Makefile                                       # +1 line (build target
 ```
 
 **Total estimated**: ~2700 lines of new code, ~190 lines of modifications.
+
+---
+
+## Known Issues / Future Work
+
+### LUT Size Reduction (1024 → 256)
+
+The correction LUT was reduced from 1024 entries per direction (2048 bytes total)
+to 256 entries (512 bytes total) due to heap memory exhaustion on the STM32F446.
+
+**Root cause**: Each `phase_stepper` struct is heap-allocated via `oid_alloc()`.
+With the LUT arrays inline, each instance consumed ~2100 bytes. Two steppers
+(X+Y) required ~4200 bytes of heap. The STM32F446 has only 128 KB RAM and
+the static allocations (BSS/data) already consume nearly all of it, leaving
+insufficient heap for the full-size LUTs.
+
+**Impact**: Phase correction granularity is now 4 electrical microsteps per
+LUT entry (MOTOR_PERIOD / LUT_SIZE = 1024 / 256). The ISR indexes the LUT
+with `motor_phase / 4` instead of direct lookup.
+
+**Fix plan**:
+1. Move LUT arrays to static BSS by pre-allocating them globally
+   (`static int8_t phase_shift_luts[MAX_PHASE_STEPPERS][2][LUT_SIZE]`)
+   rather than embedding them in the heap-allocated struct.
+2. Restore LUT to 1024 entries for full microstep resolution.
+3. Consider using flash memory (PROGMEM) for the LUT storage since it is
+   write-once-per-calibration but read at 10 kHz by the ISR.
