@@ -258,7 +258,7 @@ class CalibrateAxis:
 
         while mag <= max_mag:
             pha, response = self._sweep_phase(
-                mag, speed, motor_steps, accelerometer, gcmd)
+                harmonic, mag, speed, motor_steps, accelerometer, gcmd)
             gcmd.respond_info("    mag=%.4f: best_pha=%.4f response=%.4f"
                               % (mag, pha, response))
             if response < best_response * 0.95:
@@ -273,7 +273,7 @@ class CalibrateAxis:
             mag *= quotient
         return best_mag, best_pha
 
-    def _sweep_phase(self, mag, speed, motor_steps, accelerometer, gcmd):
+    def _sweep_phase(self, harmonic, mag, speed, motor_steps, accelerometer, gcmd):
         # Host-driven phase sweep: for a fixed magnitude, run several
         # constant-velocity moves with different correction phases and
         # measure the harmonic response at each. The response curve
