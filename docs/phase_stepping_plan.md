@@ -567,6 +567,16 @@ so 4064 pulses is ~40 µs of CPU. The TMC's STEP input needs
 calibration algorithm should cap the per-step correction
 accordingly (or add a small delay in `burst_steps`).
 
+`burst_steps` now inserts 20 NOPs (~110 ns at 180 MHz, with
+margin) between the BSRR set/reset pair and again after the
+reset. The delay is only paid when actually bursting (zero-
+correction case is free). Verified end-to-end: with mag=1.0
+harmonic 1 + mag=0.5 harmonic 3 in both forward and backward
+LUTs, and 10 round-trips of 100mm diagonal at 9000 mm/min
+with both X and Y enabled, LOST_STEPS=0 throughout. The TMC
+is correctly counting every pulse even under maximum burst
+load.
+
 ### Earlier (rejected) ISR algorithm
 
 A previous version used `target = motor_phase + correction`
@@ -607,7 +617,7 @@ many extra pulses.
   and the algorithm classes (`SlidingDftWindow`,
   `_chirp_dft_sweep`, `_find_peaks`, `_harmonic_fit`,
   `_find_approx_mag`) are scaffolded.
-- **Burst rate vs TMC STEP input timing**: 32 steps × 127
+- ~~**Burst rate vs TMC STEP input timing**: 32 steps × 127
   correction = 4064 BSRR pairs per 100 µs tick. The TMC
   needs ≥100 ns between pulses, but the burst loop blasts
   them back-to-back at ~10 ns each. The TMC's LOST_STEPS
@@ -615,19 +625,32 @@ many extra pulses.
   has large corrections the TMC may miss pulses. Fix is a
   small delay in `burst_steps` (volatile counter or `__NOP`
   loop) or a per-tick cap that respects the TMC's
-  ~500K pulses/sec input rate.
+  ~500K pulses/sec input rate.~~ **Fixed**: 20 NOPs
+  (~110 ns at 180 MHz) between BSRR set/reset pair. Cost:
+  ~220 ns per BSRR pair (was ~10 ns). For 32 ticks of 100 ns
+  per pulse (typical correction), CPU cost is 32 × ~330 ns
+  = ~10 µs per 100 µs tick, leaving 90 µs for other work.
+  Verified with mag=1.0 harmonic 1 + mag=0.5 harmonic 3,
+  both LUTs, both X+Y enabled: 10 round-trips of 100mm
+  diagonal at 9000 mm/min, LOST_STEPS=0.
 - **Chelper `message_fill()` does not bounds-check `len`
   against `MESSAGE_MAX=64`**. We work around this with
   chunk=50 in `_send_lut`, but a proper fix is a
   flexible-array `struct queue_message` plus a matching MCU
   receive-buffer bump.
-- **`zero_rotor_phase` is hardcoded to 0** in
+- ~~**`zero_rotor_phase` is hardcoded to 0** in
   `configure_phase_stepping`. The Python side reads MSCNT
   at enable time via `_sync_phase_offset` but never sends
   it to the MCU. For the current zero-correction test the
   init offset doesn't matter, but for a calibrated LUT the
   initial phase will be wrong (will produce a 1-time burst
-  on first enable).
+  on first enable).~~ **Fixed**: new
+  `set_phase_stepping_zero_phase` MCU command is sent from
+  `_enable` after `_sync_phase_offset` and before the ISR
+  is armed. Verified with mag=1.0 harmonic 1: 20 round-trips
+  of 50mm at 6000 mm/min return to the start position with
+  LOST_STEPS=0 and state `ready` — the rotor is correctly
+  aligned to the LUT, no precession or drift.
 
 ### Multi-chunk LUT load: resolved (chelper buffer overflow)
 
