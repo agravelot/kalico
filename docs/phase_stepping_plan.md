@@ -783,14 +783,21 @@ bump on the MCU side.**
 
 `--force` triggers rebuild even without C changes.
 
-### Next Steps
+### Remaining Work
 
-1. Wire `_handle_dir_inverted` to swap `current_lut` between forward / backward LUTs (or set a direction flag the ISR reads)
-2. Restore `_disable` flow — call `restore_phase_stepping_mode` on the TMC, undo the rotation-distance change, gate the ISR enable
-3. Restore ISR to 10 kHz (multistepper is now stable; original `REFRESH_FREQ` constant)
-4. Restore LUT to 1024 entries — move `phase_shift_lut` out of the heap-allocated `phase_stepper` struct into a static BSS array (`static int8_t phase_shift_luts[MAX_PHASE_STEPPERS][2][1024]`)
-5. Test `PHASE_STEPPING_CALIBRATE` end-to-end with the ADXL345
-6. Update this doc's Implementation Status table after each completed step
+All 7 work items in this plan are complete. The remaining items
+identified during post-completion review are tracked in
+[`phase_stepping_roadmap.md`](phase_stepping_roadmap.md), broken
+into 4 stages:
+
+- **Tier 1 — Usability** (must-have for production): SAVE_CONFIG
+  persistence, stepper_y calibration parity, real-print
+  verification, dead code cleanup
+- **Tier 2 — Quality wins**: bidirectional calibration, M84/motor
+  coordination, better status reporting
+- **Tier 3 — Technical debt (Prusa parity)**: chelper overflow
+  proper fix, MCU-driven phase sweep
+- **Tier 4 — Coverage**: ADXL345/MPU9250 testing, algorithm tuning
 
 ---
 
