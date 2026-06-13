@@ -303,7 +303,7 @@ class CalibrateAxis:
             aclient = accelerometer.start_internal_client()
             # accel=0.0: pure constant-velocity, no trapezoidal profile.
             # This guarantees the harmonic analysis is valid.
-            stepper.manual_move(dist_mm, speed_mm_s, accel=0.0)
+            force_move.manual_move(stepper, dist_mm, speed_mm_s, accel=0.0)
             toolhead.wait_moves()
             aclient.finish_measurements()
             samples = aclient.get_samples()
@@ -325,7 +325,7 @@ class CalibrateAxis:
             corr.set_harmonic(harmonic, mag, pha)
             self.ps.update_correction()
             aclient = accelerometer.start_internal_client()
-            stepper.manual_move(dist_mm, speed_mm_s, accel=0.0)
+            force_move.manual_move(stepper, dist_mm, speed_mm_s, accel=0.0)
             toolhead.wait_moves()
             aclient.finish_measurements()
             samples = aclient.get_samples()
@@ -458,7 +458,7 @@ class CalibrateAxis:
         # Use a small acceleration (50 mm/s^2) to avoid stalling
         # the motor when starting at non-zero speed. accel=0.0
         # caused a stall in earlier tests.
-        stepper.manual_move(dist_mm, speed_mm_s, accel=50.0)
+        fm.manual_move(stepper, dist_mm, speed_mm_s, accel=50.0)
         toolhead.wait_moves()
 
         aclient.finish_measurements()
