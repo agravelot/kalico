@@ -80,7 +80,6 @@ class PhaseStepping:
         self.phase_oid = None
         self.enabled = False
         self.load_lut_cmd = None
-        self._cfg_cmd = None
 
         self.full_steps = config.getint("motor_steps", 200, minval=1)
         self.microsteps = config.getint("microsteps", 16, minval=1)
@@ -159,29 +158,26 @@ class PhaseStepping:
     def _build_phase_stepping_config(self):
         mcu = self.stepper.get_mcu()
         self.phase_oid = mcu.create_oid()
-        self._step_pin = self.stepper.get_step_pin()
-        self._dir_pin = self.stepper.get_dir_pin()
+        step_pin = self.stepper.get_step_pin()
+        dir_pin = self.stepper.get_dir_pin()
+
+        logging.info("phase_stepping %s: phase_oid=%d stepper_oid=%d",
+                     self.stepper_name, self.phase_oid,
+                     self.stepper.get_oid())
+
+        mcu.add_config_cmd(
+            "configure_phase_stepping oid=%d stepper_oid=%d"
+            " step_pin=%s dir_pin=%s zero_phase=%i steps_per_period=%u"
+            % (self.phase_oid, self.stepper.get_oid(),
+               step_pin, dir_pin, 0, self.steps_per_period))
 
         self._lut_cq = mcu.alloc_command_queue()
         self._enable_cq = mcu.alloc_command_queue()
-        self._cfg_cq = mcu.alloc_command_queue()
         self._build_phase_cmds()
         self._send_lut_init()
 
-        mcu.register_config_callback(self._send_phase_cfg)
-
-    def _send_phase_cfg(self):
-        if self._cfg_cmd:
-            self._cfg_cmd.send([self.phase_oid, self.stepper.get_oid(),
-                                self._step_pin, self._dir_pin, 0,
-                                self.steps_per_period])
-
     def _build_phase_cmds(self):
         mcu = self.stepper.get_mcu()
-        self._cfg_cmd = mcu.lookup_command(
-            "configure_phase_stepping oid=%c stepper_oid=%c"
-            " step_pin=%u dir_pin=%u zero_phase=%i steps_per_period=%u",
-            cq=self._cfg_cq)
         self.load_lut_cmd = mcu.lookup_command(
             "load_phase_lut oid=%c offset=%hu data=%*s", cq=self._lut_cq)
         self.enable_cmd = mcu.lookup_command(
