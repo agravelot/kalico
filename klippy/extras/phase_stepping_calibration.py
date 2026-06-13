@@ -141,6 +141,10 @@ class CalibrateAxis:
         step = max(1, n_samples // bins)
         freq_accel = (end_freq - start_freq) / ramp_time if ramp_time > 0 else 0
 
+        # Accel samples are Accel_Measurement(time, x, y, z) namedtuples.
+        # Project onto the axis most relevant to this stepper.
+        ax_idx = {"stepper_x": 1, "stepper_y": 2}.get(
+            self.ps.stepper_name, 1)
         for i in range(0, n_samples, step):
             t = i / sample_rate
             if t <= ramp_time:
@@ -165,7 +169,7 @@ class CalibrateAxis:
 
             end_idx = min(i + step, n_samples)
             for j in range(i, end_idx):
-                dft.feed(samples[j], s, c)
+                dft.feed(samples[j][ax_idx], s, c)
 
             speed = freq / motor_steps * 2.0  # rev/s
             results.append((speed, dft.get_magnitude()))
@@ -278,17 +282,16 @@ class CalibrateAxis:
         toolhead = self.printer.lookup_object("toolhead")
         force_move = self.printer.lookup_object("force_move")
         stepper = force_move.lookup_stepper(self.ps.stepper_name)
-        # Move distance: 1 full revolution at the target speed.
-        # accel=0.0 makes it pure constant-velocity.
-        dist = 1.0
-        speed_mm_s = speed * motor_steps * (self.ps.rotation_distance
-                                            / motor_steps) / 60.0
-        # Convert rev/s to mm/s using the stepper's rotation_distance
-        # (1 rev = rotation_distance mm). Fall back to a default if
-        # the stepper doesn't expose it cleanly.
+        # Move distance: 1 full revolution (1.0 rev). Convert rev/s
+        # to mm/s using the stepper's rotation_distance.
+        revs_per_move = 1.0
         rot_dist = self._get_rotation_distance(stepper)
-        if rot_dist is not None:
-            speed_mm_s = speed * rot_dist
+        if rot_dist is None or rot_dist <= 0:
+            raise gcmd.error(
+                "Cannot determine rotation_distance for %s"
+                % self.ps.stepper_name)
+        dist_mm = revs_per_move * rot_dist
+        speed_mm_s = speed * rot_dist
         best_pha = 0.0
         best_resp = float("inf")
         results = []
@@ -298,7 +301,9 @@ class CalibrateAxis:
             corr.set_harmonic(harmonic, mag, pha)
             self.ps.update_correction()
             aclient = accelerometer.start_internal_client()
-            stepper.manual_move(dist, speed_mm_s, accel=0.0)
+            # accel=0.0: pure constant-velocity, no trapezoidal profile.
+            # This guarantees the harmonic analysis is valid.
+            stepper.manual_move(dist_mm, speed_mm_s, accel=0.0)
             toolhead.wait_moves()
             aclient.finish_measurements()
             samples = aclient.get_samples()
@@ -320,7 +325,7 @@ class CalibrateAxis:
             corr.set_harmonic(harmonic, mag, pha)
             self.ps.update_correction()
             aclient = accelerometer.start_internal_client()
-            stepper.manual_move(dist, speed_mm_s, accel=0.0)
+            stepper.manual_move(dist_mm, speed_mm_s, accel=0.0)
             toolhead.wait_moves()
             aclient.finish_measurements()
             samples = aclient.get_samples()
@@ -337,6 +342,14 @@ class CalibrateAxis:
         try:
             rot_dist, _ = stepper.get_rotation_distance()
             return rot_dist
+        except Exception:
+            return None
+
+    def _get_stepper_rotation_distance(self, stepper_name):
+        try:
+            fm = self.printer.lookup_object("force_move")
+            stepper = fm.lookup_stepper(stepper_name)
+            return self._get_rotation_distance(stepper)
         except Exception:
             return None
 
@@ -403,21 +416,49 @@ class CalibrateAxis:
         except Exception:
             pass
 
-        # Phase 1: Speed sweep
+        # Phase 1: Speed sweep. Drive the stepper (not the toolhead)
+        # via force_move to avoid crashing into endstops. We do a
+        # constant-velocity move (accel=0.0) of N revolutions at the
+        # configured speed range. The beacon accelerometer is on the
+        # toolhead, so we need real toolhead motion for vibration
+        # measurement — but the *kinematics* of the move are still
+        # single-stepper so we can use force_move safely.
         gcmd.respond_info("Phase 1: Speed sweep...")
         aclient = accel_chip.start_internal_client()
 
         min_speed, max_speed = self.config.speed_range
-        # Generate a linear speed ramp movement
-        duration = self.config.coarse_duration
         revs = self.config.max_movement_revs
-        start_pos = 0.0
-        end_pos = revs
+        avg_speed = 0.5 * (min_speed + max_speed)
+        rot_dist = self._get_stepper_rotation_distance(
+            self.ps.stepper_name)
+        if rot_dist is None or rot_dist <= 0:
+            raise gcmd.error(
+                "Cannot determine rotation_distance for %s"
+                % self.ps.stepper_name)
+        dist_mm = revs * rot_dist
+        speed_mm_s = avg_speed * rot_dist
 
-        # Move forward accelerating
-        toolhead.manual_move([start_pos, None, None, None], min_speed * 60)
-        toolhead.manual_move([end_pos, None, None, None], max_speed * 60)
+        # Make sure we have headroom on the toolhead's X/Y range. The
+        # beacon's toolhead can be at any position; if the move would
+        # exceed the rail, we cancel. Voron2 350 has ~350mm X travel.
+        if dist_mm > 200:
+            gcmd.respond_info(
+                "  WARNING: requested move %.1fmm > safe 200mm,"
+                " reducing revs" % dist_mm)
+            revs = 200.0 / rot_dist
+            dist_mm = revs * rot_dist
 
+        gcmd.respond_info(
+            "  Moving stepper %s by %.1fmm (%.1f revs) at %.1f rev/s"
+            " (%.1f mm/s)" % (self.ps.stepper_name, dist_mm, revs,
+                              avg_speed, speed_mm_s))
+
+        fm = self.printer.lookup_object("force_move")
+        stepper = fm.lookup_stepper(self.ps.stepper_name)
+        # Use a small acceleration (50 mm/s^2) to avoid stalling
+        # the motor when starting at non-zero speed. accel=0.0
+        # caused a stall in earlier tests.
+        stepper.manual_move(dist_mm, speed_mm_s, accel=50.0)
         toolhead.wait_moves()
 
         aclient.finish_measurements()
