@@ -484,7 +484,7 @@ together. Calibration last since it depends on everything else working.
 | WI 6 — Communications protocol | **Done** | `configure_phase_stepping`, `load_phase_lut` (chunked), `enable_phase_stepping` |
 | WI 7 — Build system & Kconfig | **Done** | `CONFIG_WANT_TMC_PHASE_STEP`, STM32 Makefile target |
 | WI 2 — Host phase stepping module | **Done** | `klippy/extras/phase_stepping.py` (~310 lines) |
-| WI 3 — Calibration module | **Skeleton** | `klippy/extras/phase_stepping_calibration.py` exists but not tested |
+| WI 3 — Calibration module | **Skeleton** | `klippy/extras/phase_stepping_calibration.py` exists; G-code runs end-to-end, but `_capture_param_sweep` is a stub. Data path (correction→LUT→motion) verified via `PHASE_STEPPING_SET_HARMONIC` |
 | WI 5 — Stepper integration | **Partial** | `stepper_get_position_by_oid()` exposed; rotation distance adjustment works |
 
 ### Multi-stepper support (fixed)
@@ -512,30 +512,122 @@ so `mcu.create_oid()` and `mcu.add_config_cmd()` execute inside
 ### What Works
 
 - `PHASE_STEPPING_STATUS` — reports enabled state and correction items
+- `PHASE_STEPPING_SET_HARMONIC STEPPER=<n> H=<h> MAG=<m> PHA=<p>
+  DIR=<forward|backward>` — set one harmonic and re-send LUT (test
+  command added so the calibration data path can be exercised
+  without a full accelerometer run)
 - `PHASE_STEPPING_ENABLE STEPPER=stepper_x ENABLE=1` and
   `PHASE_STEPPING_ENABLE STEPPER=stepper_y ENABLE=1` — both can be
   active concurrently:
   1. `TMC5160.set_phase_stepping_mode()` — sets mres=0 (256µstep), intpol=0, ihold=irun via SPI
-  2. `TMC5160.query_phase()` — reads MSCNT register for phase sync (✓ values ~136, ~913 observed)
-  3. LUT chunked loading — 3 chunks of 200 bytes each (256 forward + 256 backward = 512 bytes)
+  2. `TMC5160.query_phase()` — reads MSCNT register for phase sync
+  3. LUT chunked loading — 41 chunks of 50 bytes each (1024 forward + 1024 backward = 2048 bytes)
   4. `enable_phase_stepping oid=%c enable=%c` — starts ISR on MCU
   5. Rotation distance adjustment — sets `rotation_dist * 256 / microsteps`
-- ISR runs at 1 kHz, phase tracking correct, MCU stable (tested 20+ seconds per stepper, both concurrently)
+- ISR runs at 10 kHz, **with a real correction-only burst
+  algorithm** (see "ISR implementation" below), phase tracking
+  correct under actual stepper motion (tested with 200mm
+  round-trips at 12 000 mm/min and 100mm diagonal round-trips
+  at 9000 mm/min with both X and Y enabled: LOST_STEPS=0,
+  XACTUAL=0 after round trips, no MCU overruns, no shutdowns).
+
+### ISR implementation: correction-only burst (key design)
+
+The ISR does **not** replicate every Klippy step pulse. Klippy's
+normal stepper driver already drives the TMC STEP input via
+the shared step pin, so the MCU's role is to add *extra*
+correction pulses on top.
+
+```c
+for each enabled phase_stepper:
+    position = stepper_get_position_by_oid(stepper_oid)
+    step_count = (int32_t)(position - 0x40000000)  // signed
+    step_delta = step_count - last_burst_step_count
+    if step_delta != 0:
+        cap at 32 steps per 100 µs tick
+        for each new step:
+            phase = pos_to_phase(stepper, position_of_this_step)
+            correction = current_lut[phase]  // signed int8
+            if moving backward: correction = -correction
+            accumulate into total_burst
+        burst_steps(total_burst)  // single batched BSRR write
+        last_burst_step_count += count
+```
+
+Total TMC pulses per Klippy step = `1` (Klippy) `+ lut[phase]`
+(extra). For an all-zero LUT (the uncalibrated case) the ISR
+fires nothing extra and the motor tracks Klippy exactly.
+For a non-zero LUT, the extra pulses nudge the rotor to the
+corrected electrical phase.
+
+**Per-tick budget** (32 steps × 127 max correction = 4064
+extra pulses in 100 µs): at 180 MHz, each BSRR pair is ~10 ns
+so 4064 pulses is ~40 µs of CPU. The TMC's STEP input needs
+≥100 ns between pulses, which the BSRR blast violates; the
+calibration algorithm should cap the per-step correction
+accordingly (or add a small delay in `burst_steps`).
+
+### Earlier (rejected) ISR algorithm
+
+A previous version used `target = motor_phase + correction`
+and bursted `(target - driver_phase)` per tick. Because
+Klippy's normal stepper also drives the STEP pin, this
+*doubled* the step rate (one pulse from Klippy + one from the
+ISR for every planned step). The TMC's LOST_STEPS counter
+stayed at 0 (it never missed a pulse, it just received too
+many) but the toolhead position diverged from the actual rotor
+position by a factor of 2. The first multi-mm move after
+enabling phase stepping would crash the kinematics with
+"Move out of range: 355.000 ..." — the toolhead's commanded
+position was correct but the actual motor was at 2× the
+position Klippy thought.
+
+The current correction-only model is the simple fix: track
+the last step-count at which we bursted corrections, and for
+each new step just look up the LUT entry and burst *that*
+many extra pulses.
 
 ### What Does NOT Work (known gaps)
 
-- ISR runs at 10 kHz but has not been stress-tested with actual
-  stepper motion (no-load test only — both steppers enabled and
-  idle for 20+ s).
-- Calibration pipeline (`PHASE_STEPPING_CALIBRATE`) not validated
-  end-to-end. The data path is there (`build_phase_shift` /
-  `update_correction` / `cmd_PHASE_STEPPING_RESET`) but actual
-  ADC captures and harmonic fitting have not been exercised.
-- Chelper `message_fill()` does not bounds-check `len` against
-  `MESSAGE_MAX=64`. We work around this with chunk=50 in
-  `_send_lut`, but a proper fix is a flexible-array
-  `struct queue_message` plus a matching MCU receive-buffer
-  bump.
+- **Calibration algorithm is a smoke test**: the data path
+  (correction → LUT → MCU → ISR burst → motion) is verified
+  end-to-end via `PHASE_STEPPING_SET_HARMONIC`, but the
+  actual `PHASE_STEPPING_CALIBRATE` G-code still has
+  placeholder magnitude / phase optimization (`_capture_param_sweep`
+  returns a single magnitude value, no real chirp-DFT peak
+  fit, no iterative phase optimization per harmonic). A real
+  calibration requires:
+    - A real accelerometer with `start_internal_client`
+      (`beacon` works; `adxl345`/`mpu9250` not tested)
+    - Per-harmonic speed sweep at the resonant speed of that
+      harmonic
+    - Phase sweep at the optimal magnitude
+    - Magnitude refinement at the optimal phase
+  This is multi-week work; the G-code runs without crashing
+  and the algorithm classes (`SlidingDftWindow`,
+  `_chirp_dft_sweep`, `_find_peaks`, `_harmonic_fit`,
+  `_find_approx_mag`) are scaffolded.
+- **Burst rate vs TMC STEP input timing**: 32 steps × 127
+  correction = 4064 BSRR pairs per 100 µs tick. The TMC
+  needs ≥100 ns between pulses, but the burst loop blasts
+  them back-to-back at ~10 ns each. The TMC's LOST_STEPS
+  counter stayed at 0 in the test, but if a calibrated LUT
+  has large corrections the TMC may miss pulses. Fix is a
+  small delay in `burst_steps` (volatile counter or `__NOP`
+  loop) or a per-tick cap that respects the TMC's
+  ~500K pulses/sec input rate.
+- **Chelper `message_fill()` does not bounds-check `len`
+  against `MESSAGE_MAX=64`**. We work around this with
+  chunk=50 in `_send_lut`, but a proper fix is a
+  flexible-array `struct queue_message` plus a matching MCU
+  receive-buffer bump.
+- **`zero_rotor_phase` is hardcoded to 0** in
+  `configure_phase_stepping`. The Python side reads MSCNT
+  at enable time via `_sync_phase_offset` but never sends
+  it to the MCU. For the current zero-correction test the
+  init offset doesn't matter, but for a calibrated LUT the
+  initial phase will be wrong (will produce a 1-time burst
+  on first enable).
 
 ### Multi-chunk LUT load: resolved (chelper buffer overflow)
 
