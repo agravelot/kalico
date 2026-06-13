@@ -27,8 +27,8 @@ DECL_CONSTANT("PHASE_STEPPING", 1);
 // LUT granularity: 256 entries covering 1024 electrical phases
 #define LUT_SIZE 256
 #define LUT_SCALE (MOTOR_PERIOD / LUT_SIZE)
-// Refresh rate: 10 kHz = 100 µs period
-#define REFRESH_FREQ 10000
+// Refresh rate: 1 kHz = 1000 µs period
+#define REFRESH_FREQ 1000
 
 struct phase_stepper {
     uint8_t oid;
